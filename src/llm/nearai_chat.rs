@@ -237,7 +237,7 @@ impl NearAiChatProvider {
             // 502/503/504 with "model is currently unavailable" / "bad_gateway":
             // treat as RateLimited with a 30s retry_after so the retry layer
             // backs off meaningfully instead of hammering the endpoint every 1-4s.
-            if matches!(status_code, 502 | 503 | 504) {
+            if matches!(status_code, 502..=504) {
                 let lower = response_text.to_lowercase();
                 if lower.contains("unavailable") || lower.contains("bad_gateway") || lower.contains("overloaded") {
                     tracing::warn!(

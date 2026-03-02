@@ -210,21 +210,34 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         reason_ctx: &mut ReasoningContext,
     ) -> Result<(), Error> {
         const MAX_WORKER_ITERATIONS: usize = 500;
-        let max_iterations = self
+        let job_meta = self
             .context_manager()
             .get_context(self.job_id)
             .await
             .ok()
-            .and_then(|ctx| ctx.metadata.get("max_iterations").and_then(|v| v.as_u64()))
+            .map(|ctx| ctx.metadata);
+        let max_iterations = job_meta
+            .as_ref()
+            .and_then(|m| m.get("max_iterations").and_then(|v| v.as_u64()))
             .unwrap_or(50) as usize;
         let max_iterations = max_iterations.min(MAX_WORKER_ITERATIONS);
+
+        // Per-job planning override: routine jobs set "disable_planning": true in
+        // metadata so the reactive tool-call loop is used instead of the planning
+        // phase, which would pre-generate steps with placeholder values.
+        let planning_disabled_by_meta = job_meta
+            .as_ref()
+            .and_then(|m| m.get("disable_planning").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        let use_planning = self.use_planning() && !planning_disabled_by_meta;
+
         let mut iteration = 0;
 
         // Initial tool definitions for planning (will be refreshed in loop)
         reason_ctx.available_tools = self.tools().tool_definitions().await;
 
         // Generate plan if planning is enabled
-        let plan = if self.use_planning() {
+        let plan = if use_planning {
             match reasoning.plan(reason_ctx).await {
                 Ok(p) => {
                     tracing::info!(

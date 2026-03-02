@@ -426,7 +426,14 @@ async fn execute_full_job(
             reason: "scheduler not available".to_string(),
         })?;
 
-    let metadata = serde_json::json!({ "max_iterations": max_iterations });
+    // Disable the planning phase for routine jobs: planning generates steps
+    // with placeholder values (e.g. "<JSON result from price_analysis>") that
+    // get executed literally.  Routine jobs must use the reactive tool-call
+    // loop so that each step sees the actual output of previous steps.
+    let metadata = serde_json::json!({
+        "max_iterations": max_iterations,
+        "disable_planning": true,
+    });
 
     let job_id = scheduler
         .dispatch_job(&routine.user_id, title, description, Some(metadata))

@@ -18,6 +18,7 @@ use async_trait::async_trait;
 
 use crate::context::JobContext;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
+use crate::error::WorkspaceError;
 use crate::workspace::{Workspace, paths};
 
 /// Identity files that the LLM must not overwrite via tool calls.
@@ -344,18 +345,22 @@ impl Tool for MemoryReadTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParameters("missing 'path' parameter".into()))?;
 
-        let doc = self
-            .workspace
-            .read(path)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Read failed: {}", e)))?;
-
-        let output = serde_json::json!({
-            "path": doc.path,
-            "content": doc.content,
-            "word_count": doc.word_count(),
-            "updated_at": doc.updated_at.to_rfc3339(),
-        });
+        let output = match self.workspace.read(path).await {
+            Ok(doc) => serde_json::json!({
+                "found": true,
+                "path": doc.path,
+                "content": doc.content,
+                "word_count": doc.word_count(),
+                "updated_at": doc.updated_at.to_rfc3339(),
+            }),
+            Err(WorkspaceError::DocumentNotFound { .. }) => serde_json::json!({
+                "found": false,
+                "path": path,
+                "content": null,
+                "note": "File not yet written — treat as no data available for this timeframe."
+            }),
+            Err(e) => return Err(ToolError::ExecutionFailed(format!("Read failed: {}", e))),
+        };
 
         Ok(ToolOutput::success(output, start.elapsed()))
     }
