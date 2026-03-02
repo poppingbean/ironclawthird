@@ -236,3 +236,7 @@ x86_64-unknown-linux-gnu = "ubuntu-22.04"
 x86_64-pc-windows-msvc = "windows-2022"
 x86_64-apple-darwin = "macos-15-intel"
 aarch64-apple-darwin = "macos-14"
+
+# Patch libsql-ffi to fix Windows build: replace Unix `cp` command with std::fs::copy
+[patch.crates-io]
+libsql-ffi = { path = "patches/libsql-ffi" }
