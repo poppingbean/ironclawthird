@@ -171,6 +171,11 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         // Already in a terminal state (e.g. execution_loop
                         // called mark_completed itself).
                     }
+                    Ok(JobState::Completed) => {
+                        // execution_loop already called mark_completed() (e.g.
+                        // via llm_signals_completion); calling it again would
+                        // fail with "Cannot transition from completed to completed".
+                    }
                     Ok(JobState::Stuck) => {
                         // execution_loop marked this as stuck (e.g. "plan
                         // completed but work remains"); leave for self-repair.
