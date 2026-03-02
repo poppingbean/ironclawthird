@@ -226,7 +226,8 @@ impl RoutineAction {
                     max_tokens,
                 })
             }
-            "full_job" => {
+            // "direct_job" was used by earlier versions; treat as full_job.
+            "full_job" | "direct_job" => {
                 let title = config
                     .get("title")
                     .and_then(|v| v.as_str())
