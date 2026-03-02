@@ -20,7 +20,7 @@ use crate::agent::submission::{Submission, SubmissionParser, SubmissionResult};
 use crate::agent::{HeartbeatConfig as AgentHeartbeatConfig, Router, Scheduler};
 use crate::channels::{ChannelManager, IncomingMessage, OutgoingResponse, StatusUpdate};
 use crate::config::{AgentConfig, HeartbeatConfig, RoutineConfig, SkillsConfig};
-use crate::context::ContextManager;
+use crate::context::{ContextManager, JobState};
 use crate::db::Database;
 use crate::error::Error;
 use crate::extensions::ExtensionManager;
@@ -228,6 +228,36 @@ impl Agent {
     pub async fn run(self) -> Result<(), Error> {
         // Start channels
         let mut message_stream = self.channels.start_all().await?;
+
+        // Cancel any stuck jobs left over from a previous run.
+        // Their worker tasks are gone — they can never recover on their own —
+        // so cancelling them is the safest startup behaviour.
+        if let Some(store) = self.store() {
+            match store.get_stuck_jobs().await {
+                Ok(stuck_ids) if !stuck_ids.is_empty() => {
+                    tracing::info!(
+                        "Startup cleanup: cancelling {} stuck job(s) from previous run",
+                        stuck_ids.len()
+                    );
+                    for id in stuck_ids {
+                        if let Err(e) = store
+                            .update_job_status(
+                                id,
+                                JobState::Cancelled,
+                                Some("Cancelled at startup: leftover stuck job from previous run"),
+                            )
+                            .await
+                        {
+                            tracing::warn!("Startup cleanup: failed to cancel job {}: {}", id, e);
+                        }
+                    }
+                }
+                Ok(_) => {} // no stuck jobs
+                Err(e) => {
+                    tracing::warn!("Startup cleanup: failed to query stuck jobs: {}", e);
+                }
+            }
+        }
 
         // Start self-repair task with notification forwarding
         let repair = Arc::new(DefaultSelfRepair::new(
