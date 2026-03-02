@@ -319,10 +319,13 @@ impl Tool for MemoryReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file (e.g., 'MEMORY.md', 'daily/2024-01-15.md', 'projects/alpha/notes.md')"
+                    "description": "Path to the file (e.g., 'MEMORY.md', 'daily/2024-01-15.md', 'projects/alpha/notes.md'). Also accepted as 'target'."
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Alias for 'path'. Use either 'path' or 'target'."
                 }
-            },
-            "required": ["path"]
+            }
         })
     }
 
@@ -333,7 +336,13 @@ impl Tool for MemoryReadTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
-        let path = require_str(&params, "path")?;
+        // Accept both "path" and "target" so the LLM can use either consistently
+        // with memory_write (which uses "target").
+        let path = params
+            .get("path")
+            .or_else(|| params.get("target"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidParameters("missing 'path' parameter".into()))?;
 
         let doc = self
             .workspace
@@ -531,12 +540,8 @@ mod tests {
 
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["path"].is_object());
-        assert!(
-            schema["required"]
-                .as_array()
-                .unwrap()
-                .contains(&"path".into())
-        );
+        // "target" is accepted as an alias for "path"
+        assert!(schema["properties"]["target"].is_object());
     }
 
     #[test]
