@@ -234,6 +234,23 @@ impl NearAiChatProvider {
                 });
             }
 
+            // 502/503/504 with "model is currently unavailable" / "bad_gateway":
+            // treat as RateLimited with a 30s retry_after so the retry layer
+            // backs off meaningfully instead of hammering the endpoint every 1-4s.
+            if matches!(status_code, 502 | 503 | 504) {
+                let lower = response_text.to_lowercase();
+                if lower.contains("unavailable") || lower.contains("bad_gateway") || lower.contains("overloaded") {
+                    tracing::warn!(
+                        status = status_code,
+                        "Model unavailable (gateway error); backing off 30s"
+                    );
+                    return Err(LlmError::RateLimited {
+                        provider: "nearai_chat".to_string(),
+                        retry_after: Some(std::time::Duration::from_secs(30)),
+                    });
+                }
+            }
+
             let truncated = crate::agent::truncate_for_preview(&response_text, 512);
             return Err(LlmError::RequestFailed {
                 provider: "nearai_chat".to_string(),
