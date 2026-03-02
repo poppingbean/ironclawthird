@@ -16,11 +16,13 @@ use crate::skills::catalog::SkillCatalog;
 use crate::skills::registry::SkillRegistry;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
-    ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, HttpTool, JobEventsTool, JobPromptTool,
-    JobStatusTool, JsonTool, ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool,
-    MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, ShellTool, SkillInstallTool,
-    SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool, ToolAuthTool,
-    ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, WebFetchTool, WriteFileTool,
+    ApplyPatchTool, BinanceFuturesAccountTool, BinanceFuturesOrderTool, BinanceSnapshotTool,
+    CancelJobTool, CreateJobTool, EchoTool, HttpTool, JobEventsTool, JobPromptTool, JobStatusTool,
+    JsonTool, ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool,
+    MemoryWriteTool, PriceAnalysisTool, PromptQueue, ReadFileTool, ShellTool, SkillInstallTool,
+    SkillListTool, SkillRemoveTool, SkillSearchTool, TelegramNotifyTool, TimeTool,
+    ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
+    WebFetchTool, WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{Tool, ToolDomain};
@@ -69,6 +71,12 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "skill_remove",
     "message",
     "web_fetch",
+    // Trading tools (crypto_trading skill)
+    "price_analysis",
+    "binance_snapshot",
+    "binance_futures_account",
+    "binance_futures_order",
+    "telegram_notify",
 ];
 
 /// Registry of available tools.
@@ -465,6 +473,26 @@ impl ToolRegistry {
             .await;
 
         tracing::info!("Registered software builder tool");
+    }
+
+    /// Register trading tools for the crypto_trading SKILL.md.
+    ///
+    /// Tools registered:
+    /// - `price_analysis`          — Binance klines + indicator suite (RSI, MACD, BB, Ichimoku, ADX)
+    /// - `binance_snapshot`        — Order-book depth snapshot (public)
+    /// - `binance_futures_account` — Account balance + open positions (HMAC-SHA256)
+    /// - `binance_futures_order`   — Place/cancel futures orders (HMAC-SHA256, Always approval)
+    /// - `telegram_notify`         — Send messages via Telegram Bot API
+    ///
+    /// Credentials are read from environment at call time:
+    /// `BINANCE_API_KEY`, `BINANCE_API_SECRET`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+    pub fn register_trading_tools(&self) {
+        self.register_sync(Arc::new(PriceAnalysisTool::new()));
+        self.register_sync(Arc::new(BinanceSnapshotTool::new()));
+        self.register_sync(Arc::new(BinanceFuturesAccountTool::new()));
+        self.register_sync(Arc::new(BinanceFuturesOrderTool::new()));
+        self.register_sync(Arc::new(TelegramNotifyTool::new()));
+        tracing::info!("Registered 5 trading tools");
     }
 
     /// Register a WASM tool from bytes.

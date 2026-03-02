@@ -1,5 +1,6 @@
 //! Built-in tools that come with the agent.
 
+mod binance;
 mod echo;
 pub mod extension_tools;
 mod file;
@@ -12,9 +13,13 @@ pub mod path_utils;
 pub mod routine;
 pub(crate) mod shell;
 pub mod skill_tools;
+mod telegram;
 mod time;
 mod web_fetch;
 
+pub use binance::{
+    BinanceFuturesAccountTool, BinanceFuturesOrderTool, BinanceSnapshotTool, PriceAnalysisTool,
+};
 pub use echo::EchoTool;
 pub use extension_tools::{
     ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
@@ -33,6 +38,7 @@ pub use routine::{
 };
 pub use shell::ShellTool;
 pub use skill_tools::{SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool};
+pub use telegram::TelegramNotifyTool;
 pub use time::TimeTool;
 pub use web_fetch::WebFetchTool;
 

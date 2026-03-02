@@ -478,6 +478,9 @@ async fn async_main() -> anyhow::Result<()> {
         components.secrets_store.clone(),
     );
 
+    // Register trading tools (Binance futures + Telegram notifications)
+    components.tools.register_trading_tools();
+
     // ── Gateway channel ────────────────────────────────────────────────
 
     let mut gateway_url: Option<String> = None;
