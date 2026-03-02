@@ -2403,12 +2403,27 @@ function loadJobs() {
 }
 
 function renderJobsSummary(s) {
+  const cancelAllBtn = s.stuck > 0
+    ? ' <button class="btn-cancel" style="font-size:0.75rem;padding:2px 8px;margin-left:6px" onclick="cancelAllStuck()">Cancel all</button>'
+    : '';
   document.getElementById('jobs-summary').innerHTML = ''
     + summaryCard('Total', s.total, '')
     + summaryCard('In Progress', s.in_progress, 'active')
     + summaryCard('Completed', s.completed, 'completed')
     + summaryCard('Failed', s.failed, 'failed')
-    + summaryCard('Stuck', s.stuck, 'stuck');
+    + summaryCard('Stuck', s.stuck, 'stuck') + cancelAllBtn;
+}
+
+function cancelAllStuck() {
+  if (!confirm('Cancel all stuck jobs?')) return;
+  apiFetch('/api/jobs/cancel-stuck', { method: 'POST' })
+    .then((r) => {
+      showToast('Cancelled ' + (r.cancelled || 0) + ' stuck job(s)', 'success');
+      loadJobs();
+    })
+    .catch((err) => {
+      showToast('Failed: ' + err.message, 'error');
+    });
 }
 
 function summaryCard(label, count, cls) {
@@ -2434,7 +2449,7 @@ function renderJobsList(jobs) {
     const stateClass = job.state.replace(' ', '_');
 
     let actionBtns = '';
-    if (job.state === 'pending' || job.state === 'in_progress') {
+    if (job.state === 'pending' || job.state === 'in_progress' || job.state === 'stuck') {
       actionBtns = '<button class="btn-cancel" onclick="event.stopPropagation(); cancelJob(\'' + job.id + '\')">Cancel</button>';
     } else if (job.state === 'failed' || job.state === 'interrupted') {
       actionBtns = '<button class="btn-restart" onclick="event.stopPropagation(); restartJob(\'' + job.id + '\')">Restart</button>';

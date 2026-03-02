@@ -30,9 +30,9 @@ use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::IncomingMessage;
 use crate::channels::web::auth::{AuthState, auth_middleware};
 use crate::channels::web::handlers::jobs::{
-    job_files_list_handler, job_files_read_handler, jobs_cancel_handler, jobs_detail_handler,
-    jobs_events_handler, jobs_list_handler, jobs_prompt_handler, jobs_restart_handler,
-    jobs_summary_handler,
+    job_files_list_handler, job_files_read_handler, jobs_cancel_handler,
+    jobs_cancel_stuck_handler, jobs_detail_handler, jobs_events_handler, jobs_list_handler,
+    jobs_prompt_handler, jobs_restart_handler, jobs_summary_handler,
 };
 use crate::channels::web::handlers::skills::{
     skills_install_handler, skills_list_handler, skills_remove_handler, skills_search_handler,
@@ -218,6 +218,7 @@ pub async fn start_server(
         .route("/api/jobs/summary", get(jobs_summary_handler))
         .route("/api/jobs/{id}", get(jobs_detail_handler))
         .route("/api/jobs/{id}/cancel", post(jobs_cancel_handler))
+        .route("/api/jobs/cancel-stuck", post(jobs_cancel_stuck_handler))
         .route("/api/jobs/{id}/restart", post(jobs_restart_handler))
         .route("/api/jobs/{id}/prompt", post(jobs_prompt_handler))
         .route("/api/jobs/{id}/events", get(jobs_events_handler))

@@ -287,6 +287,41 @@ pub async fn jobs_cancel_handler(
     Err((StatusCode::NOT_FOUND, "Job not found".to_string()))
 }
 
+/// Cancel every agent job currently in the `stuck` state.
+pub async fn jobs_cancel_stuck_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let jobs = store
+        .list_agent_jobs()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut cancelled = 0u32;
+    for job in jobs {
+        if job.status == "stuck" {
+            if let Err(e) = store
+                .update_job_status(
+                    job.id,
+                    crate::context::JobState::Cancelled,
+                    Some("Bulk-cancelled by user (stuck)"),
+                )
+                .await
+            {
+                tracing::warn!(job_id = %job.id, "Failed to cancel stuck job: {}", e);
+            } else {
+                cancelled += 1;
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({ "cancelled": cancelled })))
+}
+
 pub async fn jobs_restart_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
