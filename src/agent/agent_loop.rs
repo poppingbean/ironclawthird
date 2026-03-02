@@ -448,6 +448,11 @@ impl Agent {
                     // Load initial event cache
                     engine.refresh_event_cache().await;
 
+                    // Advance next_fire_at for any routines that became due
+                    // while the bot was offline, so they don't all fire at once
+                    // on the first cron tick.
+                    engine.skip_overdue_on_startup().await;
+
                     // Spawn notification forwarder (mirrors heartbeat pattern)
                     let channels = self.channels.clone();
                     tokio::spawn(async move {

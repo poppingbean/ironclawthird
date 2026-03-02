@@ -67,6 +67,72 @@ impl RoutineEngine {
         }
     }
 
+    /// Advance `next_fire_at` for any cron routines that are already due at
+    /// startup, without firing them.
+    ///
+    /// When the bot restarts after being offline, every routine whose
+    /// `next_fire_at <= now` would otherwise fire immediately on the first
+    /// cron tick, causing a burst of execution.  This method moves their
+    /// `next_fire_at` forward to the next scheduled time so the first real
+    /// execution happens at the correct future moment.
+    ///
+    /// Call this once during startup, before `spawn_cron_ticker`.
+    pub async fn skip_overdue_on_startup(&self) {
+        let due = match self.store.list_due_cron_routines().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Startup: failed to query overdue routines: {}", e);
+                return;
+            }
+        };
+
+        if due.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            "Startup: skipping {} overdue cron routine(s) (will fire at next scheduled time)",
+            due.len()
+        );
+
+        for routine in due {
+            let Trigger::Cron { ref schedule } = routine.trigger else {
+                continue;
+            };
+
+            let next_fire = next_cron_fire(schedule).unwrap_or(None);
+
+            // Advance next_fire_at without touching any other runtime field.
+            // last_run_at is kept as-is (or "epoch" for never-run routines so
+            // the cooldown guard doesn't block the first real execution).
+            let last_run_at = routine.last_run_at.unwrap_or_else(Utc::now);
+
+            if let Err(e) = self
+                .store
+                .update_routine_runtime(
+                    routine.id,
+                    last_run_at,
+                    next_fire,
+                    routine.run_count,
+                    routine.consecutive_failures,
+                    &routine.state,
+                )
+                .await
+            {
+                tracing::warn!(
+                    routine = %routine.name,
+                    "Startup: failed to advance next_fire_at: {}", e
+                );
+            } else {
+                tracing::debug!(
+                    routine = %routine.name,
+                    next_fire = ?next_fire,
+                    "Startup: advanced overdue routine to next scheduled time"
+                );
+            }
+        }
+    }
+
     /// Refresh the in-memory event trigger cache from DB.
     pub async fn refresh_event_cache(&self) {
         match self.store.list_event_routines().await {
