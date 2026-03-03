@@ -308,7 +308,7 @@ impl Tool for PriceAnalysisTool {
         "Fetch Binance USDT-M Futures klines and compute technical indicators: \
          RSI(14), MACD(12,26,9), Bollinger Bands(20,2), EMA crosses (9/21, 20/50), \
          Ichimoku Cloud (9/26/52), and ADX(14). Use for multi-timeframe analysis \
-         (4h trend, 1h confirmation, 15m entry)."
+         (4h trend with fewer candles ~20, 1h confirmation, 15m entry)."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -326,7 +326,7 @@ impl Tool for PriceAnalysisTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Candles to fetch (max 500). >=100 for 15m, >=72 for 1h, >=50 for 4h.",
+                    "description": "Candles to fetch (max 500). >=100 for 15m, >=72 for 1h, 20-30 for 4h (trend direction only).",
                     "default": 100,
                     "minimum": 10,
                     "maximum": 500
