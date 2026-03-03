@@ -131,6 +131,9 @@ impl Drop for EventBuffer {
             }
 
             let _ = io::stderr().write_all(&truncated);
+            // Flush so Windows (block-buffered stderr) shows the line immediately
+            // instead of holding it until the process exits.
+            let _ = io::stderr().flush();
             return;
         };
 
@@ -142,6 +145,7 @@ impl Drop for EventBuffer {
         }
 
         let _ = io::stderr().write_all(output);
+        let _ = io::stderr().flush();
     }
 }
 
