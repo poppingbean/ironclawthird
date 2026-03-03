@@ -219,6 +219,11 @@ impl Scheduler {
     /// so that stale jobs from the previous cycle don't accumulate.  We match
     /// jobs by the `routine_id` field injected into their metadata.
     ///
+    /// For jobs that still have a live worker (InProgress), we use `stop()` which
+    /// removes the entry from `self.jobs` immediately, freeing the parallel-job
+    /// slot before `dispatch_job()` is called.  For jobs that are stuck (worker
+    /// already returned), we cancel the ContextManager state directly.
+    ///
     /// Returns the number of jobs that were cancelled.
     pub async fn cancel_stale_routine_jobs(&self, routine_id: Uuid) -> u32 {
         let routine_id_str = routine_id.to_string();
@@ -250,53 +255,65 @@ impl Scheduler {
                 continue;
             }
 
-            // Cancel in-memory state
-            let cancel_result = self
-                .context_manager
-                .update_context(job_id, |c| {
-                    c.transition_to(
-                        JobState::Cancelled,
-                        Some("Cancelled: superseded by new routine cycle".to_string()),
-                    )
-                })
-                .await;
-
-            match cancel_result {
-                Ok(Ok(())) => {}
-                Ok(Err(msg)) => {
+            if self.is_running(job_id).await {
+                // Active worker: stop() removes it from self.jobs immediately,
+                // sends Stop signal, aborts if needed, and updates state + DB.
+                // This frees the parallel-job slot so dispatch_job() can succeed.
+                if let Err(e) = self.stop(job_id).await {
                     tracing::warn!(
                         job = %job_id,
-                        "Could not cancel stale routine job in-memory: {}", msg
+                        "Could not stop active stale routine job: {}", e
                     );
                     continue;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        job = %job_id,
-                        "Context error while cancelling stale routine job: {}", e
-                    );
-                    continue;
-                }
-            }
-
-            // Persist cancellation to DB
-            if let Some(ref store) = self.store {
-                let store = store.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = store
-                        .update_job_status(
-                            job_id,
+            } else {
+                // Stuck/non-running job: no slot to free, just update state.
+                let cancel_result = self
+                    .context_manager
+                    .update_context(job_id, |c| {
+                        c.transition_to(
                             JobState::Cancelled,
-                            Some("Cancelled: superseded by new routine cycle"),
+                            Some("Cancelled: superseded by new routine cycle".to_string()),
                         )
-                        .await
-                    {
+                    })
+                    .await;
+
+                match cancel_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(msg)) => {
                         tracing::warn!(
                             job = %job_id,
-                            "Failed to persist routine job cancellation: {}", e
+                            "Could not cancel stale stuck routine job: {}", msg
                         );
+                        continue;
                     }
-                });
+                    Err(e) => {
+                        tracing::warn!(
+                            job = %job_id,
+                            "Context error cancelling stale stuck routine job: {}", e
+                        );
+                        continue;
+                    }
+                }
+
+                if let Some(ref store) = self.store {
+                    let store = store.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = store
+                            .update_job_status(
+                                job_id,
+                                JobState::Cancelled,
+                                Some("Cancelled: superseded by new routine cycle"),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                job = %job_id,
+                                "Failed to persist routine job cancellation: {}", e
+                            );
+                        }
+                    });
+                }
             }
 
             tracing::info!(
