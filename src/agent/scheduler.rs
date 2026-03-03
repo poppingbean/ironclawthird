@@ -136,6 +136,13 @@ impl Scheduler {
                 return Ok(());
             }
 
+            // Eagerly evict finished handles before counting.  The per-job
+            // cleanup tasks poll at 1-second intervals, so under burst scheduling
+            // (many routines firing at once) several finished handles can still
+            // be present in the map when the next dispatch arrives.
+            // JoinHandle::is_finished() is non-blocking — safe to call under lock.
+            jobs.retain(|_, sj| !sj.handle.is_finished());
+
             if jobs.len() >= self.config.max_parallel_jobs {
                 return Err(JobError::MaxJobsExceeded {
                     max: self.config.max_parallel_jobs,
@@ -561,13 +568,17 @@ impl Scheduler {
 
     /// Stop a running job.
     pub async fn stop(&self, job_id: Uuid) -> Result<(), JobError> {
-        let mut jobs = self.jobs.write().await;
+        // Remove from the map immediately (under the write lock) so the slot is
+        // freed before any I/O happens.  Holding a write lock across a sleep or
+        // channel send would block every concurrent `schedule()` call for the
+        // duration of the sleep.
+        let scheduled = self.jobs.write().await.remove(&job_id);
 
-        if let Some(scheduled) = jobs.remove(&job_id) {
-            // Send stop signal
+        if let Some(scheduled) = scheduled {
+            // Send stop signal (write lock already released)
             let _ = scheduled.tx.send(WorkerMessage::Stop).await;
 
-            // Give it a moment to clean up
+            // Give it a moment to clean up gracefully
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
             // Abort if still running
