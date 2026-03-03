@@ -213,6 +213,103 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Cancel any pending/in-progress/stuck jobs that belong to a routine.
+    ///
+    /// Called by the routine engine before dispatching a new cycle of a routine,
+    /// so that stale jobs from the previous cycle don't accumulate.  We match
+    /// jobs by the `routine_id` field injected into their metadata.
+    ///
+    /// Returns the number of jobs that were cancelled.
+    pub async fn cancel_stale_routine_jobs(&self, routine_id: Uuid) -> u32 {
+        let routine_id_str = routine_id.to_string();
+        let all = self.context_manager.all_jobs().await;
+        let mut cancelled = 0u32;
+
+        for job_id in all {
+            let ctx = match self.context_manager.get_context(job_id).await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            // Skip jobs that don't belong to this routine
+            let belongs = ctx
+                .metadata
+                .get("routine_id")
+                .and_then(|v| v.as_str())
+                == Some(&routine_id_str);
+            if !belongs {
+                continue;
+            }
+
+            // Skip jobs that are already done
+            if matches!(
+                ctx.state,
+                JobState::Completed | JobState::Submitted | JobState::Accepted
+                    | JobState::Failed | JobState::Cancelled
+            ) {
+                continue;
+            }
+
+            // Cancel in-memory state
+            let cancel_result = self
+                .context_manager
+                .update_context(job_id, |c| {
+                    c.transition_to(
+                        JobState::Cancelled,
+                        Some("Cancelled: superseded by new routine cycle".to_string()),
+                    )
+                })
+                .await;
+
+            match cancel_result {
+                Ok(Ok(())) => {}
+                Ok(Err(msg)) => {
+                    tracing::warn!(
+                        job = %job_id,
+                        "Could not cancel stale routine job in-memory: {}", msg
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        job = %job_id,
+                        "Context error while cancelling stale routine job: {}", e
+                    );
+                    continue;
+                }
+            }
+
+            // Persist cancellation to DB
+            if let Some(ref store) = self.store {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = store
+                        .update_job_status(
+                            job_id,
+                            JobState::Cancelled,
+                            Some("Cancelled: superseded by new routine cycle"),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            job = %job_id,
+                            "Failed to persist routine job cancellation: {}", e
+                        );
+                    }
+                });
+            }
+
+            tracing::info!(
+                job = %job_id,
+                routine = %routine_id,
+                "Cancelled stale job from previous routine cycle"
+            );
+            cancelled += 1;
+        }
+
+        cancelled
+    }
+
     /// Schedule a sub-task from within a worker.
     ///
     /// Sub-tasks are lightweight tasks that don't go through the full job lifecycle.

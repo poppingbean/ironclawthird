@@ -492,6 +492,19 @@ async fn execute_full_job(
             reason: "scheduler not available".to_string(),
         })?;
 
+    // Cancel any pending/in-progress/stuck jobs left over from a previous cycle
+    // of this same routine before we dispatch the new one.  This prevents
+    // stale jobs from accumulating when the cycle period is shorter than the
+    // job's execution time or when the previous job got stuck.
+    let cancelled = scheduler.cancel_stale_routine_jobs(routine.id).await;
+    if cancelled > 0 {
+        tracing::info!(
+            routine = %routine.name,
+            cancelled,
+            "Cancelled stale job(s) from previous routine cycle before dispatching new one"
+        );
+    }
+
     // Disable the planning phase for routine jobs: planning generates steps
     // with placeholder values (e.g. "<JSON result from price_analysis>") that
     // get executed literally.  Routine jobs must use the reactive tool-call
@@ -503,6 +516,8 @@ async fn execute_full_job(
         // write files, etc. without blocking on human confirmation.
         // Always-approval tools are still blocked even with this flag.
         "auto_approve": true,
+        // Tag the job so cancel_stale_routine_jobs() can find it next cycle.
+        "routine_id": routine.id.to_string(),
     });
 
     let job_id = scheduler
