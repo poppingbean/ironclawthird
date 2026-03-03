@@ -277,6 +277,10 @@ pub trait RoutineStore: Send + Sync {
         limit: i64,
     ) -> Result<Vec<RoutineRun>, DatabaseError>;
     async fn count_running_routine_runs(&self, routine_id: Uuid) -> Result<i64, DatabaseError>;
+    /// Mark all routine_runs still in 'running' status as failed.
+    /// Called at startup to clear runs abandoned when the previous process died.
+    /// Returns the number of runs that were cleaned up.
+    async fn cancel_stale_routine_runs(&self) -> Result<u32, DatabaseError>;
     async fn link_routine_run_to_job(
         &self,
         run_id: Uuid,

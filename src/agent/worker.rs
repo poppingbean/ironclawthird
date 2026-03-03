@@ -529,16 +529,31 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     name: tool_name.to_string(),
                 })?;
 
-        // Tools requiring approval are blocked in autonomous jobs
-        if tool.requires_approval(params).is_required() {
+        // Fetch job context early — needed for approval check, hooks, and rate limiting.
+        let job_ctx = deps.context_manager.get_context(job_id).await?;
+
+        // Routine-dispatched jobs set "auto_approve": true in metadata so that
+        // tools marked UnlessAutoApproved (e.g. order placement, file writes)
+        // can run without blocking on human confirmation.
+        // Always-approval tools are still blocked regardless of this flag.
+        let auto_approve = job_ctx
+            .metadata
+            .get("auto_approve")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let approval = tool.requires_approval(params);
+        let blocked = match approval {
+            crate::tools::ApprovalRequirement::Never => false,
+            crate::tools::ApprovalRequirement::UnlessAutoApproved => !auto_approve,
+            crate::tools::ApprovalRequirement::Always => true,
+        };
+        if blocked {
             return Err(crate::error::ToolError::AuthRequired {
                 name: tool_name.to_string(),
             }
             .into());
         }
-
-        // Fetch job context early so we have the real user_id for hooks and rate limiting
-        let job_ctx = deps.context_manager.get_context(job_id).await?;
 
         // Check per-tool rate limit before running hooks or executing (cheaper check first)
         if let Some(config) = tool.rate_limit_config()

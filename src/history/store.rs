@@ -1265,6 +1265,21 @@ impl Store {
         Ok(row.get("cnt"))
     }
 
+    /// Mark all routine_runs still in 'running' status as failed.
+    /// Returns the number of rows updated.
+    pub async fn cancel_stale_routine_runs(&self) -> Result<u32, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .execute(
+                "UPDATE routine_runs SET status = 'failed', completed_at = NOW(), \
+                 result_summary = 'Cancelled at startup: abandoned running run' \
+                 WHERE status = 'running'",
+                &[],
+            )
+            .await?;
+        Ok(rows as u32)
+    }
+
     /// Link a routine run to a dispatched job.
     pub async fn link_routine_run_to_job(
         &self,

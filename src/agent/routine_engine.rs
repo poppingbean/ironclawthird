@@ -499,6 +499,10 @@ async fn execute_full_job(
     let metadata = serde_json::json!({
         "max_iterations": max_iterations,
         "disable_planning": true,
+        // Bypass UnlessAutoApproved tools so routine jobs can place orders,
+        // write files, etc. without blocking on human confirmation.
+        // Always-approval tools are still blocked even with this flag.
+        "auto_approve": true,
     });
 
     let job_id = scheduler

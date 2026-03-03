@@ -409,6 +409,21 @@ impl RoutineStore for LibSqlBackend {
         }
     }
 
+    async fn cancel_stale_routine_runs(&self) -> Result<u32, DatabaseError> {
+        let conn = self.connect().await?;
+        let rows = conn
+            .execute(
+                "UPDATE routine_runs SET status = 'failed', \
+                 completed_at = CURRENT_TIMESTAMP, \
+                 result_summary = 'Cancelled at startup: abandoned running run' \
+                 WHERE status = 'running'",
+                libsql::params![],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(rows as u32)
+    }
+
     async fn link_routine_run_to_job(
         &self,
         run_id: Uuid,

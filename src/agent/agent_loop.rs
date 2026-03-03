@@ -257,6 +257,25 @@ impl Agent {
                     tracing::warn!("Startup cleanup: failed to query stuck jobs: {}", e);
                 }
             }
+
+            // Cancel routine_runs still in 'running' state from the previous
+            // process.  Stale runs make count_running_routine_runs() return ≥
+            // max_concurrent for every routine, blocking them all from firing.
+            match store.cancel_stale_routine_runs().await {
+                Ok(n) if n > 0 => {
+                    tracing::info!(
+                        "Startup cleanup: cancelled {} stale routine run(s) from previous session",
+                        n
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "Startup cleanup: failed to cancel stale routine runs: {}",
+                        e
+                    );
+                }
+            }
         }
 
         // Start self-repair task with notification forwarding
