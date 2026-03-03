@@ -14,7 +14,8 @@ use crate::db::Database;
 use crate::error::Error;
 use crate::hooks::HookRegistry;
 use crate::llm::{
-    ActionPlan, ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult, ToolSelection,
+    ActionPlan, ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult, Role,
+    ToolSelection,
 };
 use crate::safety::SafetyLayer;
 use crate::tools::ToolRegistry;
@@ -318,7 +319,27 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
             iteration += 1;
             if iteration > max_iterations {
-                self.mark_stuck("Maximum iterations exceeded").await?;
+                // If the last assistant message was plain text (no tool calls), the LLM
+                // has already communicated its result — it just didn't use a recognized
+                // completion phrase. Treat that as a successful completion rather than
+                // marking the job stuck. Only mark stuck when the LLM is still mid-work
+                // (i.e., the last thing it did was call tools, not deliver a response).
+                let last_assistant_is_text = reason_ctx
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == Role::Assistant)
+                    .map(|m| m.tool_calls.is_none())
+                    .unwrap_or(false);
+                if last_assistant_is_text {
+                    tracing::info!(
+                        "Job {} hit max_iterations but last response was text — treating as completed",
+                        self.job_id
+                    );
+                    self.mark_completed().await?;
+                } else {
+                    self.mark_stuck("Maximum iterations exceeded").await?;
+                }
                 return Ok(());
             }
 

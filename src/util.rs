@@ -46,7 +46,17 @@ pub fn llm_signals_completion(response: &str) -> bool {
         "i've completed",
         "all done",
         "all tasks complete",
+        // Covers "The HOLD/ORDER signal has been saved" from trading routines.
+        "has been saved",
+        "have been saved",
     ];
+
+    // If the response is just the bare sentinel word the routine prompt asked
+    // for (e.g. "Reply 'SAVED' when done"), treat that as completion too.
+    let trimmed = lower.trim().trim_end_matches(['.', '!', '\n']);
+    if trimmed == "saved" || trimmed == "no_order" {
+        return true;
+    }
 
     let negative_phrases = [
         "not complete",
