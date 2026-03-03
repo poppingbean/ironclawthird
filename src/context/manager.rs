@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::context::{JobContext, Memory};
+use crate::context::{JobContext, JobState, Memory};
 use crate::error::JobError;
 
 /// Manages contexts for multiple concurrent jobs.
@@ -48,7 +48,20 @@ impl ContextManager {
         // Hold write lock for the entire check-insert to prevent TOCTOU races
         // where two concurrent calls both pass the active_count check.
         let mut contexts = self.contexts.write().await;
-        let active_count = contexts.values().filter(|c| c.state.is_active()).count();
+        // Count only jobs that actively occupy a scheduler slot: Pending (waiting
+        // to start), InProgress (running), and Stuck (awaiting self-repair).
+        // Completed / Submitted / Accepted / Failed / Cancelled jobs are finished
+        // and must NOT count against the limit — they would otherwise accumulate
+        // and permanently block new dispatches after max_jobs routine cycles.
+        let active_count = contexts
+            .values()
+            .filter(|c| {
+                matches!(
+                    c.state,
+                    JobState::Pending | JobState::InProgress | JobState::Stuck
+                )
+            })
+            .count();
 
         if active_count >= self.max_jobs {
             return Err(JobError::MaxJobsExceeded { max: self.max_jobs });
