@@ -71,12 +71,20 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "skill_remove",
     "message",
     "web_fetch",
-    // Trading tools (crypto_trading skill)
+    // Trading tools (crypto_trading skill) — protect both underscore AND hyphenated
+    // variants so a dynamically built/installed WASM tool (e.g. binance-futures.wasm)
+    // can never be registered under a near-identical name and shadow the real built-ins.
     "price_analysis",
     "binance_snapshot",
+    "binance-snapshot",
     "binance_futures_account",
     "binance_futures_order",
+    "binance_futures",
+    "binance-futures",
+    "binance-futures-account",
+    "binance-futures-order",
     "telegram_notify",
+    "telegram-notify",
 ];
 
 /// Registry of available tools.
