@@ -1059,9 +1059,9 @@ impl Tool for BinanceFuturesOrderTool {
         if needs_qty && resolved_qty.is_none() {
             return Err(ToolError::InvalidParameters(format!(
                 "quantity is required for {order_type} orders. \
-                 Provide margin_usdt (collateral, e.g. 5) and leverage (e.g. 50) \
-                 so the tool can calculate notional size automatically, \
-                 or provide quantity_usdt (notional in USDT) or quantity (base units)."
+                 Use balance_pct (e.g. 10) with leverage to auto-size from available \
+                 balance, or provide quantity_usdt (notional in USDT) or quantity \
+                 (base asset units)."
             )));
         }
 
