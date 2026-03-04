@@ -128,6 +128,41 @@ async fn fetch_mark_price(client: &Client, symbol: &str) -> Result<f64, ToolErro
         .ok_or_else(|| ToolError::ExternalService("Invalid markPrice in response".into()))
 }
 
+/// Fetch the USDT futures `availableBalance` from `/fapi/v2/account`.
+/// Used for percentage-of-balance order sizing.
+async fn fetch_available_balance(
+    client: &Client,
+    api_key: &str,
+    api_secret: &str,
+) -> Result<f64, ToolError> {
+    let ts = timestamp_ms()?;
+    let query = format!("timestamp={ts}");
+    let sig = sign_query(api_secret, &query)?;
+    let url = format!("{FAPI_BASE}/fapi/v2/account?{query}&signature={sig}");
+    let resp = client
+        .get(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(|e| ToolError::ExternalService(format!("Balance fetch failed: {e}")))?;
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ToolError::ExternalService(format!(
+            "Balance fetch {st}: {body}"
+        )));
+    }
+    let raw: Value = resp
+        .json()
+        .await
+        .map_err(|e| ToolError::ExternalService(format!("Balance JSON: {e}")))?;
+    raw["availableBalance"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&b| b > 0.0)
+        .ok_or_else(|| ToolError::ExternalService("availableBalance missing or zero".into()))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Technical indicator helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -814,8 +849,9 @@ impl Tool for BinanceFuturesOrderTool {
         "Place a USDT-M Futures order on Binance. Supported types: LIMIT (entries), \
          STOP_MARKET and TAKE_PROFIT_MARKET (closes). Can optionally set \
          leverage before placing the order. Use reduce_only=true to close an existing \
-         position. Size the order with margin_usdt (collateral in USDT; notional = \
-         margin × leverage, e.g. margin_usdt=5 with leverage=50 → $250 notional). \
+         position. Size the order with balance_pct (fetches available USDT balance, \
+         takes pct% as margin, scales by leverage; e.g. balance_pct=10 with $500 \
+         balance and leverage=50 → $50 margin → $2500 notional). \
          Use entry_better_pct to improve the LIMIT entry: BUY orders are placed below \
          the signal price, SELL orders above (e.g. entry_better_pct=0.1 with BUY at \
          80000 submits at 79920). Use bracket_tp_pct / bracket_sl_pct to automatically \
@@ -842,9 +878,9 @@ impl Tool for BinanceFuturesOrderTool {
                     "enum": ["LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"],
                     "description": "Order type. Use LIMIT for entries, STOP_MARKET / TAKE_PROFIT_MARKET for closes."
                 },
-                "margin_usdt": {
+                "balance_pct": {
                     "type": "number",
-                    "description": "Collateral to risk in USDT. The notional position size is margin_usdt × leverage; the tool then divides by mark price to get base asset quantity. E.g. margin_usdt=5 with leverage=50 places a $250 notional position. Preferred over quantity_usdt for fixed-risk sizing."
+                    "description": "Size the order as this percentage of your current available USDT futures balance (fetched automatically). The margin = balance × pct/100; notional = margin × leverage; quantity = notional / mark price. E.g. balance_pct=10 with a $500 balance and leverage=50 → $50 margin → $2500 notional. Preferred sizing method."
                 },
                 "quantity": {
                     "type": "number",
@@ -993,15 +1029,17 @@ impl Tool for BinanceFuturesOrderTool {
             format!("type={order_type}"),
         ];
 
-        // Resolve quantity (priority: margin_usdt > quantity_usdt > quantity).
+        // Resolve quantity (priority: balance_pct > quantity_usdt > quantity).
         //
-        // margin_usdt: caller specifies collateral; notional = margin × leverage.
-        //   e.g. margin_usdt=5, leverage=50 → $250 notional → qty = 250 / mark
+        // balance_pct: fetch available balance, take pct% as margin, scale by leverage.
+        //   e.g. balance_pct=10, balance=$500, leverage=50 → $50 margin → $2500 notional
         // quantity_usdt: caller specifies notional directly.
         // quantity: raw base-asset units (no conversion).
         let leverage_for_qty = params["leverage"].as_f64().unwrap_or(1.0).max(1.0);
         let resolved_qty: Option<f64> =
-            if let Some(margin) = params["margin_usdt"].as_f64().filter(|&m| m > 0.0) {
+            if let Some(pct) = params["balance_pct"].as_f64().filter(|&p| p > 0.0) {
+                let balance = fetch_available_balance(&self.client, &api_key, &api_secret).await?;
+                let margin = balance * pct / 100.0;
                 let notional = margin * leverage_for_qty;
                 let mark = fetch_mark_price(&self.client, &symbol).await?;
                 // Round to 3 decimal places (Binance minimum step for BTC is 0.001)
@@ -1323,36 +1361,40 @@ mod tests {
 
     /// Verify the price adjustment formula used by entry_better_pct directly.
     /// The execute() path needs live Binance, but the math is pure and testable.
-    // ── margin_usdt sizing tests ─────────────────────────────────────────────
+    // ── balance_pct sizing tests ─────────────────────────────────────────────
 
-    // margin_usdt × leverage = notional; notional / mark = qty (floored to 3dp)
+    // balance × pct/100 = margin; margin × leverage = notional; notional / mark = qty
     #[test]
-    fn test_margin_usdt_notional_calculation() {
-        let margin = 5.0_f64;
+    fn test_balance_pct_notional_calculation() {
+        let balance = 500.0_f64;
+        let pct = 10.0_f64;
         let leverage = 50.0_f64;
         let mark_price = 80_000.0_f64;
 
-        let notional = margin * leverage; // 250.0
-        assert_eq!(notional, 250.0);
+        let margin = balance * pct / 100.0; // 50.0
+        let notional = margin * leverage; // 2500.0
+        assert_eq!(margin, 50.0);
+        assert_eq!(notional, 2500.0);
 
         // qty = floor(notional / mark * 1000) / 1000
         let qty = (notional / mark_price * 1000.0).floor() / 1000.0;
-        assert_eq!(qty, 0.003); // 250 / 80000 = 0.003125 → floored = 0.003
+        assert_eq!(qty, 0.031); // 2500 / 80000 = 0.03125 → floored = 0.031
     }
 
     #[test]
-    fn test_margin_usdt_scales_with_leverage() {
-        let margin = 5.0_f64;
+    fn test_balance_pct_scales_with_leverage() {
+        let balance = 500.0_f64;
+        let pct = 10.0_f64; // $50 margin
         let mark_price = 50_000.0_f64;
 
-        // 10x: notional = 50, qty = floor(50/50000 * 1000)/1000 = 0.001
-        let qty_10x = ((margin * 10.0) / mark_price * 1000.0).floor() / 1000.0;
-        // 50x: notional = 250, qty = floor(250/50000 * 1000)/1000 = 0.005
-        let qty_50x = ((margin * 50.0) / mark_price * 1000.0).floor() / 1000.0;
+        // 10x: notional = 500, qty = floor(500/50000 * 1000)/1000 = 0.010
+        let qty_10x = ((balance * pct / 100.0 * 10.0) / mark_price * 1000.0).floor() / 1000.0;
+        // 50x: notional = 2500, qty = floor(2500/50000 * 1000)/1000 = 0.050
+        let qty_50x = ((balance * pct / 100.0 * 50.0) / mark_price * 1000.0).floor() / 1000.0;
 
         assert!(qty_50x > qty_10x, "higher leverage → larger position");
-        assert_eq!(qty_10x, 0.001);
-        assert_eq!(qty_50x, 0.005);
+        assert_eq!(qty_10x, 0.010);
+        assert_eq!(qty_50x, 0.050);
     }
 
     // ── entry_better_pct unit tests ──────────────────────────────────────────
