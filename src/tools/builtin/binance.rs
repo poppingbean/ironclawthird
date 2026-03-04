@@ -783,7 +783,7 @@ impl Tool for BinanceFuturesAccountTool {
 
 /// Places, closes, or cancels a USDT-M Futures order on Binance.
 ///
-/// Supports LIMIT / STOP_MARKET / TAKE_PROFIT_MARKET order types (prefer LIMIT for entries).
+/// Supports LIMIT / STOP_MARKET / TAKE_PROFIT_MARKET order types.
 /// If `leverage` is provided, the symbol's leverage is set first.
 /// Requires `auto_approve: true` in routine metadata or explicit user approval.
 pub struct BinanceFuturesOrderTool {
@@ -811,8 +811,8 @@ impl Tool for BinanceFuturesOrderTool {
     }
 
     fn description(&self) -> &str {
-        "Place a USDT-M Futures order on Binance. Prefer LIMIT orders for entries; \
-         also supports STOP_MARKET and TAKE_PROFIT_MARKET types. Can optionally set \
+        "Place a USDT-M Futures order on Binance. Supported types: LIMIT (entries), \
+         STOP_MARKET and TAKE_PROFIT_MARKET (closes). Can optionally set \
          leverage before placing the order. Use reduce_only=true to close an existing \
          position. Size the order with margin_usdt (collateral in USDT; notional = \
          margin × leverage, e.g. margin_usdt=5 with leverage=50 → $250 notional). \
@@ -839,8 +839,8 @@ impl Tool for BinanceFuturesOrderTool {
                 },
                 "order_type": {
                     "type": "string",
-                    "enum": ["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"],
-                    "description": "Order type. MARKET executes immediately."
+                    "enum": ["LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"],
+                    "description": "Order type. Use LIMIT for entries, STOP_MARKET / TAKE_PROFIT_MARKET for closes."
                 },
                 "margin_usdt": {
                     "type": "number",
@@ -1006,14 +1006,26 @@ impl Tool for BinanceFuturesOrderTool {
                 let mark = fetch_mark_price(&self.client, &symbol).await?;
                 // Round to 3 decimal places (Binance minimum step for BTC is 0.001)
                 let qty = (notional / mark * 1000.0).floor() / 1000.0;
-                Some(qty)
+                Some(qty).filter(|&q| q > 0.0)
             } else if let Some(usdt) = params["quantity_usdt"].as_f64().filter(|&u| u > 0.0) {
                 let mark = fetch_mark_price(&self.client, &symbol).await?;
                 let qty = (usdt / mark * 1000.0).floor() / 1000.0;
-                Some(qty)
+                Some(qty).filter(|&q| q > 0.0)
             } else {
                 params["quantity"].as_f64().filter(|&q| q > 0.0)
             };
+
+        // LIMIT orders require quantity; catch missing/zero qty early
+        // so the caller gets a clear error instead of a cryptic Binance rejection.
+        let needs_qty = order_type == "LIMIT";
+        if needs_qty && resolved_qty.is_none() {
+            return Err(ToolError::InvalidParameters(format!(
+                "quantity is required for {order_type} orders. \
+                 Provide margin_usdt (collateral, e.g. 5) and leverage (e.g. 50) \
+                 so the tool can calculate notional size automatically, \
+                 or provide quantity_usdt (notional in USDT) or quantity (base units)."
+            )));
+        }
 
         if let Some(qty) = resolved_qty {
             parts.push(format!("quantity={qty}"));
@@ -1096,31 +1108,19 @@ impl Tool for BinanceFuturesOrderTool {
         });
 
         // ── Bracket orders (auto TP + SL) ────────────────────────────────────
-        // When bracket_tp_pct / bracket_sl_pct are provided, place
-        // TAKE_PROFIT_MARKET and STOP_MARKET orders to close the entire
-        // position.  Price targets are derived from the entry price:
-        //   price_move = pct / (100 * leverage)
+        // When bracket_tp_pct / bracket_sl_pct are provided on a LIMIT entry,
+        // automatically place TAKE_PROFIT_MARKET and STOP_MARKET close orders.
+        // Price targets: price_move = pct / (100 * leverage)
         // e.g. bracket_tp_pct=35, leverage=50 → TP/SL at ± 0.7% from entry.
-        // For LIMIT orders, `effective_price` (already adjusted by entry_better_pct)
-        // is used as the bracket reference so TP/SL track the actual order price.
-        // For MARKET orders the actual avgPrice from the fill is used.
-        if matches!(order_type.as_str(), "MARKET" | "LIMIT")
+        // Uses effective_price (already adjusted by entry_better_pct) as reference.
+        if order_type == "LIMIT"
             && let (Some(tp_pct), Some(sl_pct)) = (
                 params["bracket_tp_pct"].as_f64(),
                 params["bracket_sl_pct"].as_f64(),
             )
         {
                 let leverage = params["leverage"].as_f64().unwrap_or(1.0).max(1.0);
-                // LIMIT orders: use effective_price (adjusted by entry_better_pct if set).
-                // MARKET orders: use the actual fill price (avgPrice).
-                let fill_price = if order_type == "LIMIT" {
-                    effective_price.unwrap_or(0.0)
-                } else {
-                    body["avgPrice"]
-                        .as_str()
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .unwrap_or(0.0)
-                };
+                let fill_price = effective_price.unwrap_or(0.0);
 
                 if fill_price > 0.0 {
                     let tp_move = tp_pct / 100.0 / leverage;
