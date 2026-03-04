@@ -57,9 +57,11 @@ fn build_client(timeout_secs: u64) -> Client {
         .unwrap_or_default()
 }
 
-/// Place a reduce-only close order (TP or SL) using `closePosition=true`.
-/// This closes the entire open position at the given trigger price without
-/// needing to specify a quantity.
+/// Place a bracket close order (TP or SL) with an explicit quantity and
+/// `reduceOnly=true`. Using explicit quantity instead of `closePosition=true`
+/// allows the order to be pre-placed while the entry LIMIT is still pending
+/// (Binance rejects `closePosition=true` with -4046 when no position exists).
+/// `workingType=MARK_PRICE` avoids wick-triggered fills on contract price.
 #[allow(clippy::too_many_arguments)]
 async fn place_close_order(
     client: &Client,
@@ -70,11 +72,13 @@ async fn place_close_order(
     order_type: &str, // TAKE_PROFIT_MARKET or STOP_MARKET
     stop_price: f64,
     position_side: &str,
+    quantity: f64,
 ) -> Result<Value, ToolError> {
     let ts = timestamp_ms()?;
     let query = format!(
         "symbol={symbol}&side={side}&type={order_type}&stopPrice={stop_price}\
-         &closePosition=true&positionSide={position_side}&timestamp={ts}"
+         &quantity={quantity}&reduceOnly=true&workingType=MARK_PRICE\
+         &positionSide={position_side}&timestamp={ts}"
     );
     let sig = sign_query(api_secret, &query)?;
     let url = format!("{FAPI_BASE}/fapi/v1/order?{query}&signature={sig}");
@@ -458,6 +462,31 @@ impl Tool for PriceAnalysisTool {
                     "default": 100,
                     "minimum": 10,
                     "maximum": 500
+                },
+                "signal_price": {
+                    "type": "number",
+                    "description": "Raw signal entry price from the analysis. When provided together with signal_side and trading params, the tool computes execution_prices so Telegram reports match actual order prices."
+                },
+                "signal_side": {
+                    "type": "string",
+                    "enum": ["BUY", "SELL"],
+                    "description": "Trade direction for the signal. Required when signal_price is provided."
+                },
+                "leverage": {
+                    "type": "number",
+                    "description": "Leverage to use. Required for execution_prices calculation."
+                },
+                "entry_better_pct": {
+                    "type": "number",
+                    "description": "Same as binance_futures_order entry_better_pct: pct% of margin after leverage improvement on the entry price."
+                },
+                "bracket_tp_pct": {
+                    "type": "number",
+                    "description": "Same as binance_futures_order bracket_tp_pct: take-profit as % of margin after leverage."
+                },
+                "bracket_sl_pct": {
+                    "type": "number",
+                    "description": "Same as binance_futures_order bracket_sl_pct: stop-loss as % of margin after leverage."
                 }
             },
             "required": ["symbol"]
@@ -539,7 +568,58 @@ impl Tool for PriceAnalysisTool {
             None => serde_json::json!({"error": "insufficient data"}),
         };
 
-        let result = serde_json::json!({
+        // Optional: compute execution_prices using the same formula as
+        // binance_futures_order so Telegram reports match actual order prices.
+        // Requires: signal_price + signal_side + leverage.
+        let execution_prices = if let (Some(sig_price), Some(sig_side)) = (
+            params["signal_price"].as_f64().filter(|&p| p > 0.0),
+            params["signal_side"].as_str(),
+        ) {
+            let lev = params["leverage"].as_f64().unwrap_or(1.0).max(1.0);
+            let round1 = |p: f64| (p * 10.0).round() / 10.0;
+
+            // Adjust entry the same way binance_futures_order does
+            let entry = if let Some(ep) = params["entry_better_pct"].as_f64().filter(|&p| p > 0.0) {
+                let factor = ep / 100.0 / lev;
+                if sig_side == "BUY" {
+                    round1(sig_price * (1.0 - factor))
+                } else {
+                    round1(sig_price * (1.0 + factor))
+                }
+            } else {
+                sig_price
+            };
+
+            // Compute TP / SL from adjusted entry
+            let tp_sl = if let (Some(tp_pct), Some(sl_pct)) = (
+                params["bracket_tp_pct"].as_f64(),
+                params["bracket_sl_pct"].as_f64(),
+            ) {
+                let tp_move = tp_pct / 100.0 / lev;
+                let sl_move = sl_pct / 100.0 / lev;
+                let (tp, sl) = if sig_side == "BUY" {
+                    (round1(entry * (1.0 + tp_move)), round1(entry * (1.0 - sl_move)))
+                } else {
+                    (round1(entry * (1.0 - tp_move)), round1(entry * (1.0 + sl_move)))
+                };
+                serde_json::json!({ "tp_price": tp, "sl_price": sl })
+            } else {
+                serde_json::json!({})
+            };
+
+            serde_json::json!({
+                "entry_price": entry,
+                "signal_price": r2(sig_price),
+                "side": sig_side,
+                "leverage": lev,
+                "tp_price": tp_sl["tp_price"],
+                "sl_price": tp_sl["sl_price"]
+            })
+        } else {
+            serde_json::json!(null)
+        };
+
+        let mut result = serde_json::json!({
             "symbol": symbol, "interval": interval,
             "candles_fetched": candles.len(), "current_price": r2(price),
             "indicators": {
@@ -558,6 +638,9 @@ impl Tool for PriceAnalysisTool {
                 "adx": adx_obj
             }
         });
+        if !execution_prices.is_null() {
+            result["execution_prices"] = execution_prices;
+        }
         Ok(ToolOutput::success(result, start.elapsed()))
     }
 
@@ -1198,6 +1281,9 @@ impl Tool for BinanceFuturesOrderTool {
                         .unwrap_or("BOTH")
                         .to_uppercase();
 
+                    // Same quantity as the entry — closes exactly the opened position.
+                    let bracket_qty = resolved_qty.unwrap_or(0.0);
+
                     let tp_order = place_close_order(
                         &self.client,
                         &api_key,
@@ -1207,6 +1293,7 @@ impl Tool for BinanceFuturesOrderTool {
                         "TAKE_PROFIT_MARKET",
                         tp_price,
                         &ps,
+                        bracket_qty,
                     )
                     .await
                     .map_err(|e| ToolError::ExternalService(format!(
@@ -1221,17 +1308,25 @@ impl Tool for BinanceFuturesOrderTool {
                         "STOP_MARKET",
                         sl_price,
                         &ps,
+                        bracket_qty,
                     )
                     .await
                     .map_err(|e| ToolError::ExternalService(format!(
                         "Entry placed but STOP_MARKET failed (sl_price={sl_price}): {e}"
                     )))?;
 
+                    // Top-level summary for easy LLM consumption —
+                    // use these values when notifying Telegram so the
+                    // reported prices match what was actually placed.
                     let bracket_result = serde_json::json!({
                         "order_placed": true,
-                        "entry": entry_result,
-                        "fill_price": fill_price,
+                        "entry_price": fill_price,
+                        "tp_price": tp_price,
+                        "sl_price": sl_price,
+                        "side": side,
+                        "symbol": symbol,
                         "leverage": leverage,
+                        "entry": entry_result,
                         "take_profit": {
                             "price": tp_price,
                             "margin_pct": tp_pct,
