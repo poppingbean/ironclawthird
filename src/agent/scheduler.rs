@@ -244,11 +244,8 @@ impl Scheduler {
             };
 
             // Skip jobs that don't belong to this routine
-            let belongs = ctx
-                .metadata
-                .get("routine_id")
-                .and_then(|v| v.as_str())
-                == Some(&routine_id_str);
+            let belongs =
+                ctx.metadata.get("routine_id").and_then(|v| v.as_str()) == Some(&routine_id_str);
             if !belongs {
                 continue;
             }
@@ -256,8 +253,11 @@ impl Scheduler {
             // Skip jobs that are already done
             if matches!(
                 ctx.state,
-                JobState::Completed | JobState::Submitted | JobState::Accepted
-                    | JobState::Failed | JobState::Cancelled
+                JobState::Completed
+                    | JobState::Submitted
+                    | JobState::Accepted
+                    | JobState::Failed
+                    | JobState::Cancelled
             ) {
                 continue;
             }

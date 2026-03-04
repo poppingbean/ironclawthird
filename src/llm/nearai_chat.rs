@@ -239,7 +239,10 @@ impl NearAiChatProvider {
             // backs off meaningfully instead of hammering the endpoint every 1-4s.
             if matches!(status_code, 502..=504) {
                 let lower = response_text.to_lowercase();
-                if lower.contains("unavailable") || lower.contains("bad_gateway") || lower.contains("overloaded") {
+                if lower.contains("unavailable")
+                    || lower.contains("bad_gateway")
+                    || lower.contains("overloaded")
+                {
                     tracing::warn!(
                         status = status_code,
                         "Model unavailable (gateway error); backing off 30s"

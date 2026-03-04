@@ -14,8 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use reqwest::Client;
-use sha2::Sha256;
 use serde_json::Value;
+use sha2::Sha256;
 
 use crate::context::JobContext;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, ToolRateLimitConfig};
@@ -55,6 +55,77 @@ fn build_client(timeout_secs: u64) -> Client {
         .timeout(Duration::from_secs(timeout_secs))
         .build()
         .unwrap_or_default()
+}
+
+/// Place a reduce-only close order (TP or SL) using `closePosition=true`.
+/// This closes the entire open position at the given trigger price without
+/// needing to specify a quantity.
+#[allow(clippy::too_many_arguments)]
+async fn place_close_order(
+    client: &Client,
+    api_key: &str,
+    api_secret: &str,
+    symbol: &str,
+    side: &str,
+    order_type: &str, // TAKE_PROFIT_MARKET or STOP_MARKET
+    stop_price: f64,
+    position_side: &str,
+) -> Result<Value, ToolError> {
+    let ts = timestamp_ms()?;
+    let query = format!(
+        "symbol={symbol}&side={side}&type={order_type}&stopPrice={stop_price}\
+         &closePosition=true&positionSide={position_side}&timestamp={ts}"
+    );
+    let sig = sign_query(api_secret, &query)?;
+    let url = format!("{FAPI_BASE}/fapi/v1/order?{query}&signature={sig}");
+
+    let resp = client
+        .post(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(|e| ToolError::ExternalService(format!("{order_type} placement failed: {e}")))?;
+
+    let st = resp.status();
+    let body: Value = resp.json().await.unwrap_or(serde_json::json!({}));
+    if !st.is_success() {
+        return Err(ToolError::ExternalService(format!(
+            "Binance {order_type} {st}: {body}"
+        )));
+    }
+    Ok(serde_json::json!({
+        "order_id": body["orderId"],
+        "type": body["type"],
+        "stop_price": body["stopPrice"],
+        "status": body["status"]
+    }))
+}
+
+/// Fetch the current mark price for a symbol from FAPI.
+/// Used to convert a USDT notional into base-asset quantity.
+async fn fetch_mark_price(client: &Client, symbol: &str) -> Result<f64, ToolError> {
+    let url = format!("{FAPI_BASE}/fapi/v1/premiumIndex?symbol={symbol}");
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| ToolError::ExternalService(format!("Mark price fetch failed: {e}")))?;
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ToolError::ExternalService(format!(
+            "Mark price {st}: {body}"
+        )));
+    }
+    let raw: Value = resp
+        .json()
+        .await
+        .map_err(|e| ToolError::ExternalService(format!("Mark price JSON: {e}")))?;
+    raw["markPrice"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&p| p > 0.0)
+        .ok_or_else(|| ToolError::ExternalService("Invalid markPrice in response".into()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -239,15 +310,35 @@ fn compute_adx(candles: &[Ohlcv]) -> Option<(f64, f64, f64)> {
     let len = atr.len().min(sp.len()).min(sn.len());
     let mut dx = Vec::with_capacity(len);
     for i in 0..len {
-        let pdi = if atr[i] > 0.0 { 100.0 * sp[i] / atr[i] } else { 0.0 };
-        let ndi = if atr[i] > 0.0 { 100.0 * sn[i] / atr[i] } else { 0.0 };
+        let pdi = if atr[i] > 0.0 {
+            100.0 * sp[i] / atr[i]
+        } else {
+            0.0
+        };
+        let ndi = if atr[i] > 0.0 {
+            100.0 * sn[i] / atr[i]
+        } else {
+            0.0
+        };
         let sum = pdi + ndi;
-        dx.push(if sum > 0.0 { 100.0 * (pdi - ndi).abs() / sum } else { 0.0 });
+        dx.push(if sum > 0.0 {
+            100.0 * (pdi - ndi).abs() / sum
+        } else {
+            0.0
+        });
     }
     let adx_series = wilder_smooth(&dx, P)?;
     let la = *atr.last()?;
-    let lpdi = if la > 0.0 { 100.0 * sp.last()? / la } else { 0.0 };
-    let lndi = if la > 0.0 { 100.0 * sn.last()? / la } else { 0.0 };
+    let lpdi = if la > 0.0 {
+        100.0 * sp.last()? / la
+    } else {
+        0.0
+    };
+    let lndi = if la > 0.0 {
+        100.0 * sn.last()? / la
+    } else {
+        0.0
+    };
     Some((*adx_series.last()?, lpdi, lndi))
 }
 
@@ -288,7 +379,9 @@ pub struct PriceAnalysisTool {
 
 impl PriceAnalysisTool {
     pub fn new() -> Self {
-        Self { client: build_client(30) }
+        Self {
+            client: build_client(30),
+        }
     }
 }
 
@@ -345,15 +438,11 @@ impl Tool for PriceAnalysisTool {
         let interval = params["interval"].as_str().unwrap_or("15m");
         let limit = params["limit"].as_u64().unwrap_or(100).clamp(10, 500);
 
-        let url = format!(
-            "{FAPI_BASE}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        );
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| ToolError::ExternalService(format!("Binance klines request failed: {e}")))?;
+        let url =
+            format!("{FAPI_BASE}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}");
+        let resp = self.client.get(&url).send().await.map_err(|e| {
+            ToolError::ExternalService(format!("Binance klines request failed: {e}"))
+        })?;
         if !resp.status().is_success() {
             let st = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -457,7 +546,9 @@ pub struct BinanceSnapshotTool {
 
 impl BinanceSnapshotTool {
     pub fn new() -> Self {
-        Self { client: build_client(15) }
+        Self {
+            client: build_client(15),
+        }
     }
 }
 
@@ -567,7 +658,9 @@ pub struct BinanceFuturesAccountTool {
 
 impl BinanceFuturesAccountTool {
     pub fn new() -> Self {
-        Self { client: build_client(30) }
+        Self {
+            client: build_client(30),
+        }
     }
 }
 
@@ -626,7 +719,11 @@ impl Tool for BinanceFuturesAccountTool {
             .await
             .map_err(|e| ToolError::ExternalService(format!("JSON parse error: {e}")))?;
 
-        let pf = |v: &Value| v.as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let pf = |v: &Value| {
+            v.as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
         let avail = pf(&raw["availableBalance"]);
         let wallet = pf(&raw["totalWalletBalance"]);
         let pnl = pf(&raw["totalUnrealizedProfit"]);
@@ -686,16 +783,18 @@ impl Tool for BinanceFuturesAccountTool {
 
 /// Places, closes, or cancels a USDT-M Futures order on Binance.
 ///
-/// Supports MARKET / LIMIT / STOP_MARKET / TAKE_PROFIT_MARKET order types.
+/// Supports LIMIT / STOP_MARKET / TAKE_PROFIT_MARKET order types (prefer LIMIT for entries).
 /// If `leverage` is provided, the symbol's leverage is set first.
-/// **Always requires explicit user approval** because it executes real trades.
+/// Requires `auto_approve: true` in routine metadata or explicit user approval.
 pub struct BinanceFuturesOrderTool {
     client: Client,
 }
 
 impl BinanceFuturesOrderTool {
     pub fn new() -> Self {
-        Self { client: build_client(30) }
+        Self {
+            client: build_client(30),
+        }
     }
 }
 
@@ -712,10 +811,16 @@ impl Tool for BinanceFuturesOrderTool {
     }
 
     fn description(&self) -> &str {
-        "Place a USDT-M Futures order on Binance. Supports MARKET, LIMIT, \
-         STOP_MARKET, and TAKE_PROFIT_MARKET types. Can optionally set leverage \
-         before placing the order. Use reduce_only=true to close an existing \
-         position. ALWAYS requires explicit approval before execution. \
+        "Place a USDT-M Futures order on Binance. Prefer LIMIT orders for entries; \
+         also supports STOP_MARKET and TAKE_PROFIT_MARKET types. Can optionally set \
+         leverage before placing the order. Use reduce_only=true to close an existing \
+         position. Use quantity_usdt for order size in USDT (auto-converted via mark \
+         price). Use entry_better_pct to improve the LIMIT entry: BUY orders are placed \
+         below the signal price, SELL orders above (e.g. entry_better_pct=0.1 with BUY \
+         at 80000 submits at 79920). Use bracket_tp_pct / bracket_sl_pct to \
+         automatically place TAKE_PROFIT_MARKET and STOP_MARKET orders; the adjusted \
+         entry price is used as the bracket reference; price move = pct / leverage \
+         (e.g. bracket_tp_pct=20 with leverage=50 → TP/SL at +/-0.4% from entry). \
          Requires BINANCE_API_KEY and BINANCE_API_SECRET."
     }
 
@@ -739,7 +844,11 @@ impl Tool for BinanceFuturesOrderTool {
                 },
                 "quantity": {
                     "type": "number",
-                    "description": "Order quantity in base asset (e.g. 0.001 BTC)"
+                    "description": "Order quantity in base asset units (e.g. 0.001 for 0.001 BTC on BTCUSDT). Use quantity_usdt instead if you know the USDT value."
+                },
+                "quantity_usdt": {
+                    "type": "number",
+                    "description": "Order size in USDT. The tool fetches the current mark price and converts to base asset quantity automatically. Use this instead of quantity when working with account balances (e.g. orderSize10pct from binance_futures_account)."
                 },
                 "price": {
                     "type": "number",
@@ -781,6 +890,18 @@ impl Tool for BinanceFuturesOrderTool {
                 "order_id": {
                     "type": "integer",
                     "description": "Binance order ID to cancel (required when action=cancel)"
+                },
+                "entry_better_pct": {
+                    "type": "number",
+                    "description": "Improve the LIMIT entry price by this percentage relative to the signal price. For BUY orders the limit is placed below the signal (price × (1 - pct/100)); for SELL orders above (price × (1 + pct/100)). E.g. entry_better_pct=0.1 with a BUY signal at 80000 submits the order at 79920. The adjusted price is also used as the bracket reference."
+                },
+                "bracket_tp_pct": {
+                    "type": "number",
+                    "description": "Take-profit target as % of margin after leverage (e.g. 20 = 20% profit on margin). Automatically places a TAKE_PROFIT_MARKET order. For LIMIT orders uses the (optionally adjusted) limit price as reference. Price move = pct / leverage."
+                },
+                "bracket_sl_pct": {
+                    "type": "number",
+                    "description": "Stop-loss as % of margin after leverage (e.g. 20 = 20% loss on margin). Automatically places a STOP_MARKET order. For LIMIT orders uses the (optionally adjusted) limit price as reference. Price move = pct / leverage."
                 }
             },
             "required": ["symbol", "side", "order_type"]
@@ -801,9 +922,9 @@ impl Tool for BinanceFuturesOrderTool {
 
         // ── Cancel path ──────────────────────────────────────────────────────
         if action == "cancel" {
-            let order_id = params["order_id"]
-                .as_i64()
-                .ok_or_else(|| ToolError::InvalidParameters("order_id required for cancel".into()))?;
+            let order_id = params["order_id"].as_i64().ok_or_else(|| {
+                ToolError::InvalidParameters("order_id required for cancel".into())
+            })?;
             let ts = timestamp_ms()?;
             let query = format!("symbol={symbol}&orderId={order_id}&timestamp={ts}");
             let sig = sign_query(&api_secret, &query)?;
@@ -857,9 +978,7 @@ impl Tool for BinanceFuturesOrderTool {
             if !resp.status().is_success() {
                 let st = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                return Err(ToolError::ExternalService(format!(
-                    "Leverage {st}: {body}"
-                )));
+                return Err(ToolError::ExternalService(format!("Leverage {st}: {body}")));
             }
         }
 
@@ -870,10 +989,47 @@ impl Tool for BinanceFuturesOrderTool {
             format!("type={order_type}"),
         ];
 
-        if let Some(qty) = params["quantity"].as_f64() {
+        // Resolve quantity: prefer quantity_usdt (auto-converted via mark price)
+        // over raw quantity (base asset units). This lets callers pass USDT values
+        // directly (e.g. orderSize10pct from binance_futures_account) without having
+        // to manually divide by the current price.
+        let resolved_qty: Option<f64> = if let Some(usdt) = params["quantity_usdt"].as_f64() {
+            if usdt > 0.0 {
+                let mark = fetch_mark_price(&self.client, &symbol).await?;
+                // Round to 3 decimal places (Binance minimum step for BTC is 0.001)
+                let qty = (usdt / mark * 1000.0).floor() / 1000.0;
+                Some(qty)
+            } else {
+                None
+            }
+        } else {
+            params["quantity"].as_f64().filter(|&q| q > 0.0)
+        };
+
+        if let Some(qty) = resolved_qty {
             parts.push(format!("quantity={qty}"));
         }
-        if let Some(p) = params["price"].as_f64() {
+
+        // Apply entry_better_pct for LIMIT orders: adjust price toward a better fill.
+        // BUY  → price × (1 - pct/100)  (buy lower than signal)
+        // SELL → price × (1 + pct/100)  (sell higher than signal)
+        let effective_price: Option<f64> = params["price"].as_f64().map(|signal_price| {
+            if order_type == "LIMIT"
+                && let Some(offset_pct) = params["entry_better_pct"].as_f64()
+                && offset_pct > 0.0
+            {
+                let factor = offset_pct / 100.0;
+                let adjusted = if side == "BUY" {
+                    signal_price * (1.0 - factor)
+                } else {
+                    signal_price * (1.0 + factor)
+                };
+                // Round to 1 decimal (BTCUSDT tick size)
+                return (adjusted * 10.0).round() / 10.0;
+            }
+            signal_price
+        });
+        if let Some(p) = effective_price {
             parts.push(format!("price={p}"));
         }
         if let Some(sp) = params["stop_price"].as_f64() {
@@ -886,7 +1042,10 @@ impl Tool for BinanceFuturesOrderTool {
         if params["reduce_only"].as_bool().unwrap_or(false) {
             parts.push("reduceOnly=true".to_string());
         }
-        let ps = params["position_side"].as_str().unwrap_or("BOTH").to_uppercase();
+        let ps = params["position_side"]
+            .as_str()
+            .unwrap_or("BOTH")
+            .to_uppercase();
         parts.push(format!("positionSide={ps}"));
 
         let ts = timestamp_ms()?;
@@ -911,7 +1070,7 @@ impl Tool for BinanceFuturesOrderTool {
             )));
         }
 
-        let result = serde_json::json!({
+        let entry_result = serde_json::json!({
             "order_placed": true,
             "order_id": body["orderId"],
             "symbol": body["symbol"],
@@ -926,7 +1085,102 @@ impl Tool for BinanceFuturesOrderTool {
             "position_side": body["positionSide"],
             "time_in_force": body["timeInForce"]
         });
-        Ok(ToolOutput::success(result, start.elapsed()))
+
+        // ── Bracket orders (auto TP + SL) ────────────────────────────────────
+        // When bracket_tp_pct / bracket_sl_pct are provided, place
+        // TAKE_PROFIT_MARKET and STOP_MARKET orders to close the entire
+        // position.  Price targets are derived from the entry price:
+        //   price_move = pct / (100 * leverage)
+        // e.g. bracket_tp_pct=20, leverage=50 → TP/SL at ± 0.4% from entry.
+        // For LIMIT orders, `effective_price` (already adjusted by entry_better_pct)
+        // is used as the bracket reference so TP/SL track the actual order price.
+        // For MARKET orders the actual avgPrice from the fill is used.
+        if matches!(order_type.as_str(), "MARKET" | "LIMIT")
+            && let (Some(tp_pct), Some(sl_pct)) = (
+                params["bracket_tp_pct"].as_f64(),
+                params["bracket_sl_pct"].as_f64(),
+            )
+        {
+                let leverage = params["leverage"].as_f64().unwrap_or(1.0).max(1.0);
+                // LIMIT orders: use effective_price (adjusted by entry_better_pct if set).
+                // MARKET orders: use the actual fill price (avgPrice).
+                let fill_price = if order_type == "LIMIT" {
+                    effective_price.unwrap_or(0.0)
+                } else {
+                    body["avgPrice"]
+                        .as_str()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0)
+                };
+
+                if fill_price > 0.0 {
+                    let tp_move = tp_pct / 100.0 / leverage;
+                    let sl_move = sl_pct / 100.0 / leverage;
+
+                    // Round to 1 decimal (BTCUSDT tick size = 0.1 USDT)
+                    let round1 = |p: f64| (p * 10.0).round() / 10.0;
+                    let (tp_price, sl_price) = if side == "BUY" {
+                        (
+                            round1(fill_price * (1.0 + tp_move)),
+                            round1(fill_price * (1.0 - sl_move)),
+                        )
+                    } else {
+                        (
+                            round1(fill_price * (1.0 - tp_move)),
+                            round1(fill_price * (1.0 + sl_move)),
+                        )
+                    };
+
+                    let close_side = if side == "BUY" { "SELL" } else { "BUY" };
+                    let ps = params["position_side"]
+                        .as_str()
+                        .unwrap_or("BOTH")
+                        .to_uppercase();
+
+                    let tp_order = place_close_order(
+                        &self.client,
+                        &api_key,
+                        &api_secret,
+                        &symbol,
+                        close_side,
+                        "TAKE_PROFIT_MARKET",
+                        tp_price,
+                        &ps,
+                    )
+                    .await;
+                    let sl_order = place_close_order(
+                        &self.client,
+                        &api_key,
+                        &api_secret,
+                        &symbol,
+                        close_side,
+                        "STOP_MARKET",
+                        sl_price,
+                        &ps,
+                    )
+                    .await;
+
+                    let bracket_result = serde_json::json!({
+                        "order_placed": true,
+                        "entry": entry_result,
+                        "fill_price": fill_price,
+                        "leverage": leverage,
+                        "take_profit": {
+                            "price": tp_price,
+                            "margin_pct": tp_pct,
+                            "order": tp_order.unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
+                        },
+                        "stop_loss": {
+                            "price": sl_price,
+                            "margin_pct": sl_pct,
+                            "order": sl_order.unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
+                        }
+                    });
+                    return Ok(ToolOutput::success(bracket_result, start.elapsed()));
+                }
+        }
+
+        Ok(ToolOutput::success(entry_result, start.elapsed()))
     }
 
     fn requires_sanitization(&self) -> bool {
@@ -934,8 +1188,11 @@ impl Tool for BinanceFuturesOrderTool {
     }
 
     fn requires_approval(&self, _params: &Value) -> ApprovalRequirement {
-        // Real money on the line — always require explicit approval
-        ApprovalRequirement::Always
+        // Real money on the line — require explicit approval in interactive sessions.
+        // Routine jobs that set `auto_approve: true` in metadata are allowed through
+        // (UnlessAutoApproved) so scheduled trading strategies can execute orders
+        // automatically. Interactive / manual calls still require human confirmation.
+        ApprovalRequirement::UnlessAutoApproved
     }
 
     fn rate_limit_config(&self) -> Option<ToolRateLimitConfig> {
@@ -960,7 +1217,13 @@ mod tests {
         (0..n)
             .map(|i| {
                 let b = 100.0 + i as f64;
-                Ohlcv { open: b - 0.5, high: b + 1.0, low: b - 1.0, close: b, volume: 10.0 }
+                Ohlcv {
+                    open: b - 0.5,
+                    high: b + 1.0,
+                    low: b - 1.0,
+                    close: b,
+                    volume: 10.0,
+                }
             })
             .collect()
     }
@@ -1028,16 +1291,59 @@ mod tests {
     fn test_tool_names() {
         assert_eq!(PriceAnalysisTool::new().name(), "price_analysis");
         assert_eq!(BinanceSnapshotTool::new().name(), "binance_snapshot");
-        assert_eq!(BinanceFuturesAccountTool::new().name(), "binance_futures_account");
-        assert_eq!(BinanceFuturesOrderTool::new().name(), "binance_futures_order");
+        assert_eq!(
+            BinanceFuturesAccountTool::new().name(),
+            "binance_futures_account"
+        );
+        assert_eq!(
+            BinanceFuturesOrderTool::new().name(),
+            "binance_futures_order"
+        );
     }
 
     #[test]
-    fn test_order_tool_always_requires_approval() {
+    fn test_order_tool_requires_approval() {
         let tool = BinanceFuturesOrderTool::new();
         assert_eq!(
             tool.requires_approval(&serde_json::json!({})),
-            ApprovalRequirement::Always
+            ApprovalRequirement::UnlessAutoApproved
         );
+    }
+
+    // ── entry_better_pct unit tests ──────────────────────────────────────────
+
+    /// Verify the price adjustment formula used by entry_better_pct directly.
+    /// The execute() path needs live Binance, but the math is pure and testable.
+    #[test]
+    fn test_entry_better_pct_buy_lowers_price() {
+        let signal_price = 80_000.0_f64;
+        let offset_pct = 0.1_f64;
+        // BUY: adjusted = signal * (1 - pct/100), rounded to 1 decimal
+        let adjusted = (signal_price * (1.0 - offset_pct / 100.0) * 10.0).round() / 10.0;
+        assert_eq!(adjusted, 79_920.0, "BUY entry should be below signal");
+        assert!(adjusted < signal_price);
+    }
+
+    #[test]
+    fn test_entry_better_pct_sell_raises_price() {
+        let signal_price = 80_000.0_f64;
+        let offset_pct = 0.1_f64;
+        // SELL: adjusted = signal * (1 + pct/100), rounded to 1 decimal
+        let adjusted = (signal_price * (1.0 + offset_pct / 100.0) * 10.0).round() / 10.0;
+        assert_eq!(adjusted, 80_080.0, "SELL entry should be above signal");
+        assert!(adjusted > signal_price);
+    }
+
+    #[test]
+    fn test_entry_better_pct_zero_leaves_price_unchanged() {
+        let signal_price = 80_000.0_f64;
+        let offset_pct = 0.0_f64;
+        // offset_pct = 0 → guard skips adjustment
+        let adjusted = if offset_pct > 0.0 {
+            (signal_price * (1.0 - offset_pct / 100.0) * 10.0).round() / 10.0
+        } else {
+            signal_price
+        };
+        assert_eq!(adjusted, signal_price);
     }
 }

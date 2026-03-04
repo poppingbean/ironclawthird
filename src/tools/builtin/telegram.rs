@@ -86,7 +86,9 @@ impl Tool for TelegramNotifyTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidParameters("message is required".into()))?;
         if message.trim().is_empty() {
-            return Err(ToolError::InvalidParameters("message must not be empty".into()));
+            return Err(ToolError::InvalidParameters(
+                "message must not be empty".into(),
+            ));
         }
 
         let bot_token = std::env::var("TELEGRAM_BOT_TOKEN")
@@ -126,15 +128,15 @@ impl Tool for TelegramNotifyTool {
             .unwrap_or_else(|_| serde_json::json!({"ok": false}));
 
         if !status.is_success() || !resp_body["ok"].as_bool().unwrap_or(false) {
-            let desc = resp_body["description"]
-                .as_str()
-                .unwrap_or("unknown error");
+            let desc = resp_body["description"].as_str().unwrap_or("unknown error");
             return Err(ToolError::ExternalService(format!(
                 "Telegram API {status}: {desc}"
             )));
         }
 
-        let msg_id = resp_body["result"]["message_id"].as_i64().unwrap_or_default();
+        let msg_id = resp_body["result"]["message_id"]
+            .as_i64()
+            .unwrap_or_default();
 
         let result = serde_json::json!({
             "ok": true,

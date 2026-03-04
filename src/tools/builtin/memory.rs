@@ -17,8 +17,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::context::JobContext;
-use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
 use crate::error::WorkspaceError;
+use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
 use crate::workspace::{Workspace, paths};
 
 /// Identity files that the LLM must not overwrite via tool calls.
