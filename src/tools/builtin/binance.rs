@@ -1163,7 +1163,16 @@ impl Tool for BinanceFuturesOrderTool {
             )
         {
                 let leverage = params["leverage"].as_f64().unwrap_or(1.0).max(1.0);
-                let fill_price = effective_price.unwrap_or(0.0);
+                // Prefer the adjusted limit price (entry_better_pct applied).
+                // Fall back to body["price"] which Binance always echoes back for
+                // LIMIT orders — this handles the case where the caller omits `price`
+                // from params (e.g. routine passes signal_price under a different key).
+                let fill_price = effective_price.unwrap_or_else(|| {
+                    body["price"]
+                        .as_str()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0)
+                });
 
                 if fill_price > 0.0 {
                     let tp_move = tp_pct / 100.0 / leverage;
@@ -1199,7 +1208,10 @@ impl Tool for BinanceFuturesOrderTool {
                         tp_price,
                         &ps,
                     )
-                    .await;
+                    .await
+                    .map_err(|e| ToolError::ExternalService(format!(
+                        "Entry placed but TAKE_PROFIT_MARKET failed (tp_price={tp_price}): {e}"
+                    )))?;
                     let sl_order = place_close_order(
                         &self.client,
                         &api_key,
@@ -1210,7 +1222,10 @@ impl Tool for BinanceFuturesOrderTool {
                         sl_price,
                         &ps,
                     )
-                    .await;
+                    .await
+                    .map_err(|e| ToolError::ExternalService(format!(
+                        "Entry placed but STOP_MARKET failed (sl_price={sl_price}): {e}"
+                    )))?;
 
                     let bracket_result = serde_json::json!({
                         "order_placed": true,
@@ -1220,12 +1235,12 @@ impl Tool for BinanceFuturesOrderTool {
                         "take_profit": {
                             "price": tp_price,
                             "margin_pct": tp_pct,
-                            "order": tp_order.unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
+                            "order": tp_order
                         },
                         "stop_loss": {
                             "price": sl_price,
                             "margin_pct": sl_pct,
-                            "order": sl_order.unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
+                            "order": sl_order
                         }
                     });
                     return Ok(ToolOutput::success(bracket_result, start.elapsed()));
