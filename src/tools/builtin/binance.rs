@@ -852,10 +852,11 @@ impl Tool for BinanceFuturesOrderTool {
          position. Size the order with balance_pct (fetches available USDT balance, \
          takes pct% as margin, scales by leverage; e.g. balance_pct=10 with $500 \
          balance and leverage=50 → $50 margin → $2500 notional). \
-         Use entry_better_pct to improve the LIMIT entry: BUY orders are placed below \
-         the signal price, SELL orders above (e.g. entry_better_pct=0.1 with BUY at \
-         80000 submits at 79920). Use bracket_tp_pct / bracket_sl_pct to automatically \
-         place TAKE_PROFIT_MARKET and STOP_MARKET orders; price move = pct / leverage \
+         Use entry_better_pct to improve the LIMIT entry (same scale as brackets: \
+         price_move = pct / leverage); BUY placed below signal, SELL above \
+         (e.g. entry_better_pct=30 with leverage=50 → 0.6% better than signal). \
+         Use bracket_tp_pct / bracket_sl_pct to automatically place \
+         TAKE_PROFIT_MARKET and STOP_MARKET orders; price move = pct / leverage \
          (e.g. bracket_tp_pct=35 with leverage=50 → TP/SL at +/-0.7% from entry). \
          Requires BINANCE_API_KEY and BINANCE_API_SECRET."
     }
@@ -933,7 +934,7 @@ impl Tool for BinanceFuturesOrderTool {
                 },
                 "entry_better_pct": {
                     "type": "number",
-                    "description": "Improve the LIMIT entry price by this percentage relative to the signal price. For BUY orders the limit is placed below the signal (price × (1 - pct/100)); for SELL orders above (price × (1 + pct/100)). E.g. entry_better_pct=0.1 with a BUY signal at 80000 submits the order at 79920. The adjusted price is also used as the bracket reference."
+                    "description": "Improve the LIMIT entry price by pct% of margin after leverage (same scale as bracket_tp_pct). price_move = pct / (100 × leverage). BUY orders placed below signal, SELL above. E.g. entry_better_pct=30 with leverage=50 → 0.6% better: BUY signal at 80000 submits at 79520. The adjusted price is also used as the bracket TP/SL reference."
                 },
                 "bracket_tp_pct": {
                     "type": "number",
@@ -1070,14 +1071,18 @@ impl Tool for BinanceFuturesOrderTool {
         }
 
         // Apply entry_better_pct for LIMIT orders: adjust price toward a better fill.
-        // BUY  → price × (1 - pct/100)  (buy lower than signal)
-        // SELL → price × (1 + pct/100)  (sell higher than signal)
+        // Works like bracket percentages — pct is % of margin after leverage, not raw %.
+        // price_move = pct / (100 × leverage)
+        // BUY  → price × (1 - pct/100/leverage)  (buy below signal)
+        // SELL → price × (1 + pct/100/leverage)  (sell above signal)
+        // e.g. entry_better_pct=30, leverage=50 → 0.6% better than signal price
         let effective_price: Option<f64> = params["price"].as_f64().map(|signal_price| {
             if order_type == "LIMIT"
                 && let Some(offset_pct) = params["entry_better_pct"].as_f64()
                 && offset_pct > 0.0
             {
-                let factor = offset_pct / 100.0;
+                let lev = leverage_for_qty.max(1.0);
+                let factor = offset_pct / 100.0 / lev;
                 let adjusted = if side == "BUY" {
                     signal_price * (1.0 - factor)
                 } else {
@@ -1401,21 +1406,27 @@ mod tests {
 
     #[test]
     fn test_entry_better_pct_buy_lowers_price() {
+        // entry_better_pct=30, leverage=50 → price_move = 30/100/50 = 0.6%
         let signal_price = 80_000.0_f64;
-        let offset_pct = 0.1_f64;
-        // BUY: adjusted = signal * (1 - pct/100), rounded to 1 decimal
-        let adjusted = (signal_price * (1.0 - offset_pct / 100.0) * 10.0).round() / 10.0;
-        assert_eq!(adjusted, 79_920.0, "BUY entry should be below signal");
+        let offset_pct = 30.0_f64;
+        let leverage = 50.0_f64;
+        let factor = offset_pct / 100.0 / leverage; // 0.006
+        let adjusted = (signal_price * (1.0 - factor) * 10.0).round() / 10.0;
+        // 80000 * 0.994 = 79520.0
+        assert_eq!(adjusted, 79_520.0, "BUY entry should be 0.6% below signal");
         assert!(adjusted < signal_price);
     }
 
     #[test]
     fn test_entry_better_pct_sell_raises_price() {
+        // entry_better_pct=30, leverage=50 → price_move = 30/100/50 = 0.6%
         let signal_price = 80_000.0_f64;
-        let offset_pct = 0.1_f64;
-        // SELL: adjusted = signal * (1 + pct/100), rounded to 1 decimal
-        let adjusted = (signal_price * (1.0 + offset_pct / 100.0) * 10.0).round() / 10.0;
-        assert_eq!(adjusted, 80_080.0, "SELL entry should be above signal");
+        let offset_pct = 30.0_f64;
+        let leverage = 50.0_f64;
+        let factor = offset_pct / 100.0 / leverage; // 0.006
+        let adjusted = (signal_price * (1.0 + factor) * 10.0).round() / 10.0;
+        // 80000 * 1.006 = 80480.0
+        assert_eq!(adjusted, 80_480.0, "SELL entry should be 0.6% above signal");
         assert!(adjusted > signal_price);
     }
 
@@ -1425,7 +1436,8 @@ mod tests {
         let offset_pct = 0.0_f64;
         // offset_pct = 0 → guard skips adjustment
         let adjusted = if offset_pct > 0.0 {
-            (signal_price * (1.0 - offset_pct / 100.0) * 10.0).round() / 10.0
+            let factor = offset_pct / 100.0 / 50.0;
+            (signal_price * (1.0 - factor) * 10.0).round() / 10.0
         } else {
             signal_price
         };
