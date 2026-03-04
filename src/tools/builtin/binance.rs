@@ -820,7 +820,7 @@ impl Tool for BinanceFuturesOrderTool {
          at 80000 submits at 79920). Use bracket_tp_pct / bracket_sl_pct to \
          automatically place TAKE_PROFIT_MARKET and STOP_MARKET orders; the adjusted \
          entry price is used as the bracket reference; price move = pct / leverage \
-         (e.g. bracket_tp_pct=20 with leverage=50 → TP/SL at +/-0.4% from entry). \
+         (e.g. bracket_tp_pct=35 with leverage=50 → TP/SL at +/-0.7% from entry). \
          Requires BINANCE_API_KEY and BINANCE_API_SECRET."
     }
 
@@ -897,11 +897,11 @@ impl Tool for BinanceFuturesOrderTool {
                 },
                 "bracket_tp_pct": {
                     "type": "number",
-                    "description": "Take-profit target as % of margin after leverage (e.g. 20 = 20% profit on margin). Automatically places a TAKE_PROFIT_MARKET order. For LIMIT orders uses the (optionally adjusted) limit price as reference. Price move = pct / leverage."
+                    "description": "Take-profit target as % of margin after leverage (e.g. 35 = 35% profit on margin). Automatically places a TAKE_PROFIT_MARKET order. For LIMIT orders uses the (optionally adjusted) limit price as reference. Price move = pct / leverage."
                 },
                 "bracket_sl_pct": {
                     "type": "number",
-                    "description": "Stop-loss as % of margin after leverage (e.g. 20 = 20% loss on margin). Automatically places a STOP_MARKET order. For LIMIT orders uses the (optionally adjusted) limit price as reference. Price move = pct / leverage."
+                    "description": "Stop-loss as % of margin after leverage (e.g. 35 = 35% loss on margin). Automatically places a STOP_MARKET order. For LIMIT orders uses the (optionally adjusted) limit price as reference. Price move = pct / leverage."
                 }
             },
             "required": ["symbol", "side", "order_type"]
@@ -1091,7 +1091,7 @@ impl Tool for BinanceFuturesOrderTool {
         // TAKE_PROFIT_MARKET and STOP_MARKET orders to close the entire
         // position.  Price targets are derived from the entry price:
         //   price_move = pct / (100 * leverage)
-        // e.g. bracket_tp_pct=20, leverage=50 → TP/SL at ± 0.4% from entry.
+        // e.g. bracket_tp_pct=35, leverage=50 → TP/SL at ± 0.7% from entry.
         // For LIMIT orders, `effective_price` (already adjusted by entry_better_pct)
         // is used as the bracket reference so TP/SL track the actual order price.
         // For MARKET orders the actual avgPrice from the fill is used.
