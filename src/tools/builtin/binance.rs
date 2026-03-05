@@ -57,10 +57,11 @@ fn build_client(timeout_secs: u64) -> Client {
         .unwrap_or_default()
 }
 
-/// Place a bracket close order (TP or SL) with an explicit quantity and
-/// `reduceOnly=true`. Using explicit quantity instead of `closePosition=true`
-/// allows the order to be pre-placed while the entry LIMIT is still pending
-/// (Binance rejects `closePosition=true` with -4046 when no position exists).
+/// Place a bracket close order (TP or SL) pre-placed alongside a LIMIT entry.
+/// Does NOT use `reduceOnly=true` so Binance accepts the order before the entry
+/// LIMIT fills and a position exists (`reduceOnly=true` → Binance -4046 when
+/// no position is open). The TP/SL orders sit on the book; once the LIMIT fills
+/// and the position opens they act as reduce orders automatically.
 /// `workingType=MARK_PRICE` avoids wick-triggered fills on contract price.
 #[allow(clippy::too_many_arguments)]
 async fn place_close_order(
@@ -77,7 +78,7 @@ async fn place_close_order(
     let ts = timestamp_ms()?;
     let query = format!(
         "symbol={symbol}&side={side}&type={order_type}&stopPrice={stop_price}\
-         &quantity={quantity}&reduceOnly=true&workingType=MARK_PRICE\
+         &quantity={quantity}&workingType=MARK_PRICE\
          &positionSide={position_side}&timestamp={ts}"
     );
     let sig = sign_query(api_secret, &query)?;
@@ -598,9 +599,15 @@ impl Tool for PriceAnalysisTool {
                 let tp_move = tp_pct / 100.0 / lev;
                 let sl_move = sl_pct / 100.0 / lev;
                 let (tp, sl) = if sig_side == "BUY" {
-                    (round1(entry * (1.0 + tp_move)), round1(entry * (1.0 - sl_move)))
+                    (
+                        round1(entry * (1.0 + tp_move)),
+                        round1(entry * (1.0 - sl_move)),
+                    )
                 } else {
-                    (round1(entry * (1.0 - tp_move)), round1(entry * (1.0 + sl_move)))
+                    (
+                        round1(entry * (1.0 - tp_move)),
+                        round1(entry * (1.0 + sl_move)),
+                    )
                 };
                 serde_json::json!({ "tp_price": tp, "sl_price": sl })
             } else {
@@ -1245,101 +1252,105 @@ impl Tool for BinanceFuturesOrderTool {
                 params["bracket_sl_pct"].as_f64(),
             )
         {
-                let leverage = params["leverage"].as_f64().unwrap_or(1.0).max(1.0);
-                // Prefer the adjusted limit price (entry_better_pct applied).
-                // Fall back to body["price"] which Binance always echoes back for
-                // LIMIT orders — this handles the case where the caller omits `price`
-                // from params (e.g. routine passes signal_price under a different key).
-                let fill_price = effective_price.unwrap_or_else(|| {
-                    body["price"]
-                        .as_str()
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .unwrap_or(0.0)
-                });
+            let leverage = params["leverage"].as_f64().unwrap_or(1.0).max(1.0);
+            // Prefer the adjusted limit price (entry_better_pct applied).
+            // Fall back to body["price"] which Binance always echoes back for
+            // LIMIT orders — this handles the case where the caller omits `price`
+            // from params (e.g. routine passes signal_price under a different key).
+            let fill_price = effective_price.unwrap_or_else(|| {
+                body["price"]
+                    .as_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0)
+            });
 
-                if fill_price > 0.0 {
-                    let tp_move = tp_pct / 100.0 / leverage;
-                    let sl_move = sl_pct / 100.0 / leverage;
+            if fill_price > 0.0 {
+                let tp_move = tp_pct / 100.0 / leverage;
+                let sl_move = sl_pct / 100.0 / leverage;
 
-                    // Round to 1 decimal (BTCUSDT tick size = 0.1 USDT)
-                    let round1 = |p: f64| (p * 10.0).round() / 10.0;
-                    let (tp_price, sl_price) = if side == "BUY" {
-                        (
-                            round1(fill_price * (1.0 + tp_move)),
-                            round1(fill_price * (1.0 - sl_move)),
-                        )
-                    } else {
-                        (
-                            round1(fill_price * (1.0 - tp_move)),
-                            round1(fill_price * (1.0 + sl_move)),
-                        )
-                    };
-
-                    let close_side = if side == "BUY" { "SELL" } else { "BUY" };
-                    let ps = params["position_side"]
-                        .as_str()
-                        .unwrap_or("BOTH")
-                        .to_uppercase();
-
-                    // Same quantity as the entry — closes exactly the opened position.
-                    let bracket_qty = resolved_qty.unwrap_or(0.0);
-
-                    let tp_order = place_close_order(
-                        &self.client,
-                        &api_key,
-                        &api_secret,
-                        &symbol,
-                        close_side,
-                        "TAKE_PROFIT_MARKET",
-                        tp_price,
-                        &ps,
-                        bracket_qty,
+                // Round to 1 decimal (BTCUSDT tick size = 0.1 USDT)
+                let round1 = |p: f64| (p * 10.0).round() / 10.0;
+                let (tp_price, sl_price) = if side == "BUY" {
+                    (
+                        round1(fill_price * (1.0 + tp_move)),
+                        round1(fill_price * (1.0 - sl_move)),
                     )
-                    .await
-                    .map_err(|e| ToolError::ExternalService(format!(
+                } else {
+                    (
+                        round1(fill_price * (1.0 - tp_move)),
+                        round1(fill_price * (1.0 + sl_move)),
+                    )
+                };
+
+                let close_side = if side == "BUY" { "SELL" } else { "BUY" };
+                let ps = params["position_side"]
+                    .as_str()
+                    .unwrap_or("BOTH")
+                    .to_uppercase();
+
+                // Same quantity as the entry — closes exactly the opened position.
+                let bracket_qty = resolved_qty.unwrap_or(0.0);
+
+                let tp_order = place_close_order(
+                    &self.client,
+                    &api_key,
+                    &api_secret,
+                    &symbol,
+                    close_side,
+                    "TAKE_PROFIT_MARKET",
+                    tp_price,
+                    &ps,
+                    bracket_qty,
+                )
+                .await
+                .map_err(|e| {
+                    ToolError::ExternalService(format!(
                         "Entry placed but TAKE_PROFIT_MARKET failed (tp_price={tp_price}): {e}"
-                    )))?;
-                    let sl_order = place_close_order(
-                        &self.client,
-                        &api_key,
-                        &api_secret,
-                        &symbol,
-                        close_side,
-                        "STOP_MARKET",
-                        sl_price,
-                        &ps,
-                        bracket_qty,
-                    )
-                    .await
-                    .map_err(|e| ToolError::ExternalService(format!(
+                    ))
+                })?;
+                let sl_order = place_close_order(
+                    &self.client,
+                    &api_key,
+                    &api_secret,
+                    &symbol,
+                    close_side,
+                    "STOP_MARKET",
+                    sl_price,
+                    &ps,
+                    bracket_qty,
+                )
+                .await
+                .map_err(|e| {
+                    ToolError::ExternalService(format!(
                         "Entry placed but STOP_MARKET failed (sl_price={sl_price}): {e}"
-                    )))?;
+                    ))
+                })?;
 
-                    // Top-level summary for easy LLM consumption —
-                    // use these values when notifying Telegram so the
-                    // reported prices match what was actually placed.
-                    let bracket_result = serde_json::json!({
-                        "order_placed": true,
-                        "entry_price": fill_price,
-                        "tp_price": tp_price,
-                        "sl_price": sl_price,
-                        "side": side,
-                        "symbol": symbol,
-                        "leverage": leverage,
-                        "entry": entry_result,
-                        "take_profit": {
-                            "price": tp_price,
-                            "margin_pct": tp_pct,
-                            "order": tp_order
-                        },
-                        "stop_loss": {
-                            "price": sl_price,
-                            "margin_pct": sl_pct,
-                            "order": sl_order
-                        }
-                    });
-                    return Ok(ToolOutput::success(bracket_result, start.elapsed()));
-                }
+                // Top-level summary for easy LLM consumption —
+                // use these values when notifying Telegram so the
+                // reported prices match what was actually placed.
+                let bracket_result = serde_json::json!({
+                    "order_placed": true,
+                    "entry_price": fill_price,
+                    "tp_price": tp_price,
+                    "sl_price": sl_price,
+                    "side": side,
+                    "symbol": symbol,
+                    "leverage": leverage,
+                    "entry": entry_result,
+                    "take_profit": {
+                        "price": tp_price,
+                        "margin_pct": tp_pct,
+                        "order": tp_order
+                    },
+                    "stop_loss": {
+                        "price": sl_price,
+                        "margin_pct": sl_pct,
+                        "order": sl_order
+                    }
+                });
+                return Ok(ToolOutput::success(bracket_result, start.elapsed()));
+            }
         }
 
         Ok(ToolOutput::success(entry_result, start.elapsed()))
