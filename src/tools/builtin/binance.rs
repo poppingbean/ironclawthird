@@ -57,11 +57,10 @@ fn build_client(timeout_secs: u64) -> Client {
         .unwrap_or_default()
 }
 
-/// Place a bracket close order (TP or SL) pre-placed alongside a LIMIT entry.
-/// Does NOT use `reduceOnly=true` so Binance accepts the order before the entry
-/// LIMIT fills and a position exists (`reduceOnly=true` → Binance -4046 when
-/// no position is open). The TP/SL orders sit on the book; once the LIMIT fills
-/// and the position opens they act as reduce orders automatically.
+/// Place a bracket close order (TP or SL) against an open position.
+/// Uses `reduceOnly=true` so the order only reduces an existing position —
+/// never opens a new one. Called by trading_analyst AFTER the entry LIMIT
+/// has filled and a position is confirmed open.
 /// `workingType=MARK_PRICE` avoids wick-triggered fills on contract price.
 #[allow(clippy::too_many_arguments)]
 async fn place_close_order(
@@ -78,7 +77,7 @@ async fn place_close_order(
     let ts = timestamp_ms()?;
     let query = format!(
         "symbol={symbol}&side={side}&type={order_type}&stopPrice={stop_price}\
-         &quantity={quantity}&workingType=MARK_PRICE\
+         &quantity={quantity}&reduceOnly=true&workingType=MARK_PRICE\
          &positionSide={position_side}&timestamp={ts}"
     );
     let sig = sign_query(api_secret, &query)?;
