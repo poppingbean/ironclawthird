@@ -1091,24 +1091,36 @@ impl Tool for BinanceFuturesOrderTool {
             .ok_or_else(|| ToolError::InvalidParameters("order_type required".into()))?
             .to_uppercase();
 
-        // Optional leverage setting
+        // Optional leverage setting — non-fatal.
+        // Binance -4161: leverage change rejected when an open position exists in
+        // Isolated Margin Mode. In that case we continue with the current leverage
+        // rather than aborting the entire order. The warning is returned in the
+        // tool output so the caller (e.g. telegram_notify) can surface it.
+        let mut leverage_warning: Option<String> = None;
         if let Some(lev) = params["leverage"].as_u64() {
             let lev = lev.clamp(1, 125);
             let ts = timestamp_ms()?;
             let query = format!("symbol={symbol}&leverage={lev}&timestamp={ts}");
             let sig = sign_query(&api_secret, &query)?;
             let url = format!("{FAPI_BASE}/fapi/v1/leverage?{query}&signature={sig}");
-            let resp = self
+            match self
                 .client
                 .post(&url)
                 .header("X-MBX-APIKEY", &api_key)
                 .send()
                 .await
-                .map_err(|e| ToolError::ExternalService(format!("Set leverage failed: {e}")))?;
-            if !resp.status().is_success() {
-                let st = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(ToolError::ExternalService(format!("Leverage {st}: {body}")));
+            {
+                Err(e) => {
+                    leverage_warning = Some(format!("leverage set skipped (network: {e})"));
+                }
+                Ok(resp) => {
+                    if !resp.status().is_success() {
+                        let st = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        leverage_warning =
+                            Some(format!("leverage set skipped ({st}): {body}"));
+                    }
+                }
             }
         }
 
@@ -1328,7 +1340,7 @@ impl Tool for BinanceFuturesOrderTool {
                 // Top-level summary for easy LLM consumption —
                 // use these values when notifying Telegram so the
                 // reported prices match what was actually placed.
-                let bracket_result = serde_json::json!({
+                let mut bracket_result = serde_json::json!({
                     "order_placed": true,
                     "entry_price": fill_price,
                     "tp_price": tp_price,
@@ -1348,11 +1360,18 @@ impl Tool for BinanceFuturesOrderTool {
                         "order": sl_order
                     }
                 });
+                if let Some(w) = leverage_warning {
+                    bracket_result["leverage_warning"] = serde_json::Value::String(w);
+                }
                 return Ok(ToolOutput::success(bracket_result, start.elapsed()));
             }
         }
 
-        Ok(ToolOutput::success(entry_result, start.elapsed()))
+        let mut result = entry_result;
+        if let Some(w) = leverage_warning {
+            result["leverage_warning"] = serde_json::Value::String(w);
+        }
+        Ok(ToolOutput::success(result, start.elapsed()))
     }
 
     fn requires_sanitization(&self) -> bool {
