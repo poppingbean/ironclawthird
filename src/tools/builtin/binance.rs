@@ -58,9 +58,10 @@ fn build_client(timeout_secs: u64) -> Client {
 }
 
 /// Place a bracket close order (TP or SL) against an open position.
-/// Uses `reduceOnly=true` so the order only reduces an existing position —
-/// never opens a new one. Called by trading_analyst AFTER the entry LIMIT
-/// has filled and a position is confirmed open.
+/// Uses `closePosition=true` — the Binance-documented way to attach a
+/// STOP_MARKET / TAKE_PROFIT_MARKET to an existing one-way-mode position.
+/// `reduceOnly=true` triggers -4120 for these order types; `closePosition=true`
+/// is the correct alternative and closes the whole position when triggered.
 /// `workingType=MARK_PRICE` avoids wick-triggered fills on contract price.
 #[allow(clippy::too_many_arguments)]
 async fn place_close_order(
@@ -72,12 +73,12 @@ async fn place_close_order(
     order_type: &str, // TAKE_PROFIT_MARKET or STOP_MARKET
     stop_price: f64,
     position_side: &str,
-    quantity: f64,
+    _quantity: f64, // kept for call-site compat; closePosition replaces explicit qty
 ) -> Result<Value, ToolError> {
     let ts = timestamp_ms()?;
     let query = format!(
         "symbol={symbol}&side={side}&type={order_type}&stopPrice={stop_price}\
-         &quantity={quantity}&reduceOnly=true&workingType=MARK_PRICE\
+         &closePosition=true&workingType=MARK_PRICE\
          &positionSide={position_side}&timestamp={ts}"
     );
     let sig = sign_query(api_secret, &query)?;
@@ -997,7 +998,12 @@ impl Tool for BinanceFuturesOrderTool {
                 "reduce_only": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Set true to close an existing position."
+                    "description": "Set true to close an existing position (partial close with explicit quantity)."
+                },
+                "close_position": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Set true to close the ENTIRE open position when TP/SL triggers (Binance closePosition=true). Use this for STOP_MARKET and TAKE_PROFIT_MARKET when closing an open position — Binance requires this instead of reduceOnly for these order types. Only works when a position already exists."
                 },
                 "position_side": {
                     "type": "string",
@@ -1206,6 +1212,15 @@ impl Tool for BinanceFuturesOrderTool {
         }
         if params["reduce_only"].as_bool().unwrap_or(false) {
             parts.push("reduceOnly=true".to_string());
+        }
+        // close_position=true uses Binance's closePosition flag — the correct way to
+        // set STOP_MARKET / TAKE_PROFIT_MARKET against an open position in one-way mode.
+        // Binance rejects reduceOnly=true for these types with -4120; closePosition=true
+        // is the documented alternative. Requires a position to exist (-4046 otherwise).
+        if params["close_position"].as_bool().unwrap_or(false) {
+            parts.push("closePosition=true".to_string());
+            // Binance rejects closePosition=true if quantity is also present — strip it.
+            parts.retain(|p| !p.starts_with("quantity="));
         }
         let ps = params["position_side"]
             .as_str()
