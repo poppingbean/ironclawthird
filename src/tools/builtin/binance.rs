@@ -75,9 +75,20 @@ async fn place_close_order(
     quantity: f64,
 ) -> Result<Value, ToolError> {
     let ts = timestamp_ms()?;
+    // Binance hedge-mode rule: `reduceOnly` is only valid in one-way mode
+    // (positionSide=BOTH). In hedge mode (positionSide=LONG or SHORT) it
+    // triggers error -4130 "Order type not supported for this endpoint" — a
+    // misleading message that actually means the parameter combination is
+    // invalid. Omit reduceOnly in hedge mode; the positionSide alone is
+    // sufficient to target the correct position.
+    let reduce_only_param = if position_side.eq_ignore_ascii_case("BOTH") {
+        "&reduceOnly=true"
+    } else {
+        ""
+    };
     let query = format!(
         "symbol={symbol}&side={side}&type={order_type}&stopPrice={stop_price}\
-         &quantity={quantity}&reduceOnly=true&workingType=MARK_PRICE\
+         &quantity={quantity}{reduce_only_param}&workingType=MARK_PRICE\
          &positionSide={position_side}&timestamp={ts}"
     );
     let sig = sign_query(api_secret, &query)?;
@@ -1117,8 +1128,7 @@ impl Tool for BinanceFuturesOrderTool {
                     if !resp.status().is_success() {
                         let st = resp.status();
                         let body = resp.text().await.unwrap_or_default();
-                        leverage_warning =
-                            Some(format!("leverage set skipped ({st}): {body}"));
+                        leverage_warning = Some(format!("leverage set skipped ({st}): {body}"));
                     }
                 }
             }
@@ -1294,10 +1304,20 @@ impl Tool for BinanceFuturesOrderTool {
                 };
 
                 let close_side = if side == "BUY" { "SELL" } else { "BUY" };
+                // If the caller explicitly provides position_side, use it.
+                // Otherwise infer from the entry direction so hedge-mode
+                // accounts don't fall back to the invalid "BOTH" default.
+                // BUY entry opens a LONG position; SELL entry opens a SHORT.
                 let ps = params["position_side"]
                     .as_str()
-                    .unwrap_or("BOTH")
-                    .to_uppercase();
+                    .map(|s| s.to_uppercase())
+                    .unwrap_or_else(|| {
+                        if side == "BUY" {
+                            "LONG".to_string()
+                        } else {
+                            "SHORT".to_string()
+                        }
+                    });
 
                 // Same quantity as the entry — closes exactly the opened position.
                 let bracket_qty = resolved_qty.unwrap_or(0.0);
