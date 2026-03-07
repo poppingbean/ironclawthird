@@ -937,9 +937,10 @@ impl Tool for BinanceFuturesOrderTool {
 
     fn description(&self) -> &str {
         "Place a USDT-M Futures order on Binance. Supported types: LIMIT (entries), \
-         STOP_MARKET and TAKE_PROFIT_MARKET (closes). Can optionally set \
-         leverage before placing the order. Use reduce_only=true to close an existing \
-         position. Size the order with balance_pct (fetches available USDT balance, \
+         MARKET (immediate close — use with reduce_only=true + quantity), \
+         STOP_MARKET and TAKE_PROFIT_MARKET (bracket closes — use with close_position=true). \
+         Can optionally set leverage before placing the order. \
+         Size the order with balance_pct (fetches available USDT balance, \
          takes pct% as margin, scales by leverage; e.g. balance_pct=10 with $500 \
          balance and leverage=50 → $50 margin → $2500 notional). \
          Use entry_better_pct to improve the LIMIT entry (same scale as brackets: \
@@ -966,8 +967,8 @@ impl Tool for BinanceFuturesOrderTool {
                 },
                 "order_type": {
                     "type": "string",
-                    "enum": ["LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"],
-                    "description": "Order type. Use LIMIT for entries, STOP_MARKET / TAKE_PROFIT_MARKET for closes."
+                    "enum": ["LIMIT", "MARKET", "STOP_MARKET", "TAKE_PROFIT_MARKET"],
+                    "description": "Order type. LIMIT for entries. MARKET for immediate close (use with reduce_only=true + quantity=positionAmt). STOP_MARKET / TAKE_PROFIT_MARKET for bracket closes (use with close_position=true)."
                 },
                 "balance_pct": {
                     "type": "number",
@@ -1123,8 +1124,7 @@ impl Tool for BinanceFuturesOrderTool {
                     if !resp.status().is_success() {
                         let st = resp.status();
                         let body = resp.text().await.unwrap_or_default();
-                        leverage_warning =
-                            Some(format!("leverage set skipped ({st}): {body}"));
+                        leverage_warning = Some(format!("leverage set skipped ({st}): {body}"));
                     }
                 }
             }
