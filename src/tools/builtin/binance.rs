@@ -57,12 +57,20 @@ fn build_client(timeout_secs: u64) -> Client {
         .unwrap_or_default()
 }
 
-/// Place a bracket close order (TP or SL) against an open position.
-/// Uses `closePosition=true` — the Binance-documented way to attach a
-/// STOP_MARKET / TAKE_PROFIT_MARKET to an existing one-way-mode position.
-/// `reduceOnly=true` triggers -4120 for these order types; `closePosition=true`
-/// is the correct alternative and closes the whole position when triggered.
-/// `workingType=MARK_PRICE` avoids wick-triggered fills on contract price.
+/// Place a bracket close order (TP or SL) against an open position using
+/// limit-conditional order types (`TAKE_PROFIT` / `STOP`) instead of their
+/// MARKET variants (`TAKE_PROFIT_MARKET` / `STOP_MARKET`).
+///
+/// Binance rejects `STOP_MARKET` and `TAKE_PROFIT_MARKET` on `/fapi/v1/order`
+/// with -4120 ("use algo endpoint") for certain account configurations regardless
+/// of `reduceOnly` or `closePosition` flags.
+///
+/// `TAKE_PROFIT` and `STOP` are standard limit-conditional orders that are always
+/// accepted on `/fapi/v1/order`. They trigger at `stopPrice` and fill as a LIMIT
+/// at `price`. For TP the limit price equals the stop trigger. For SL the limit
+/// price is set 0.5 % below the stop trigger to absorb normal slippage; if price
+/// gaps more than 0.5 % past the stop, the order may not fill (same risk as any
+/// stop-limit). `workingType=MARK_PRICE` avoids wick-triggered fills.
 #[allow(clippy::too_many_arguments)]
 async fn place_close_order(
     client: &Client,
@@ -70,15 +78,28 @@ async fn place_close_order(
     api_secret: &str,
     symbol: &str,
     side: &str,
-    order_type: &str, // TAKE_PROFIT_MARKET or STOP_MARKET
+    order_type: &str, // "TAKE_PROFIT_MARKET" or "STOP_MARKET" — remapped below
     stop_price: f64,
     position_side: &str,
-    _quantity: f64, // kept for call-site compat; closePosition replaces explicit qty
+    quantity: f64,
 ) -> Result<Value, ToolError> {
+    // Remap market-conditional → limit-conditional so the order lands on the
+    // standard `/fapi/v1/order` endpoint instead of the algo endpoint.
+    let r1 = |p: f64| (p * 10.0).round() / 10.0;
+    let (binance_type, limit_price) = match order_type {
+        "TAKE_PROFIT_MARKET" | "TAKE_PROFIT" => ("TAKE_PROFIT", r1(stop_price)),
+        _ => {
+            // STOP_MARKET → STOP; limit price 0.5% past trigger to absorb slippage.
+            let slippage = if side == "SELL" { 0.995 } else { 1.005 };
+            ("STOP", r1(stop_price * slippage))
+        }
+    };
+    let qty = (quantity * 1000.0).floor() / 1000.0;
     let ts = timestamp_ms()?;
     let query = format!(
-        "symbol={symbol}&side={side}&type={order_type}&stopPrice={stop_price}\
-         &closePosition=true&workingType=MARK_PRICE\
+        "symbol={symbol}&side={side}&type={binance_type}&stopPrice={stop_price}\
+         &price={limit_price}&quantity={qty}&reduceOnly=true\
+         &timeInForce=GTC&workingType=MARK_PRICE\
          &positionSide={position_side}&timestamp={ts}"
     );
     let sig = sign_query(api_secret, &query)?;
@@ -968,7 +989,7 @@ impl Tool for BinanceFuturesOrderTool {
                 "order_type": {
                     "type": "string",
                     "enum": ["LIMIT", "MARKET", "STOP_MARKET", "TAKE_PROFIT_MARKET"],
-                    "description": "Order type. LIMIT for entries. MARKET for immediate close (use with reduce_only=true + quantity=positionAmt). STOP_MARKET / TAKE_PROFIT_MARKET for bracket closes (use with close_position=true)."
+                    "description": "Order type. LIMIT for entries. MARKET for immediate close (use with reduce_only=true + quantity=positionAmt). STOP_MARKET / TAKE_PROFIT_MARKET for TP/SL closes — internally remapped to STOP / TAKE_PROFIT (limit-conditional) to avoid Binance -4120; use with close_position=true or reduce_only=true + quantity."
                 },
                 "balance_pct": {
                     "type": "number",
@@ -1206,21 +1227,62 @@ impl Tool for BinanceFuturesOrderTool {
         if let Some(sp) = params["stop_price"].as_f64() {
             parts.push(format!("stopPrice={sp}"));
         }
-        if order_type == "LIMIT" {
-            let tif = params["time_in_force"].as_str().unwrap_or("GTC");
-            parts.push(format!("timeInForce={tif}"));
-        }
-        if params["reduce_only"].as_bool().unwrap_or(false) {
+        // Remap STOP_MARKET → STOP and TAKE_PROFIT_MARKET → TAKE_PROFIT so the
+        // order lands on the standard /fapi/v1/order endpoint. STOP_MARKET and
+        // TAKE_PROFIT_MARKET are rejected with -4120 on this endpoint for certain
+        // account configurations regardless of reduceOnly or closePosition flags.
+        // The limit-conditional equivalents (STOP / TAKE_PROFIT) are always accepted.
+        let is_conditional_close =
+            order_type == "STOP_MARKET" || order_type == "TAKE_PROFIT_MARKET";
+        if is_conditional_close {
+            // Replace the type part already pushed into parts.
+            let remapped = if order_type == "TAKE_PROFIT_MARKET" {
+                "TAKE_PROFIT"
+            } else {
+                "STOP"
+            };
+            for p in parts.iter_mut() {
+                if p.starts_with("type=") {
+                    *p = format!("type={remapped}");
+                    break;
+                }
+            }
+            // Add limit price for the conditional order.
+            // TP: limit == stop (fill at exact TP level).
+            // SL: limit 0.5 % past stop to absorb slippage; direction depends on side.
+            if let Some(sp) = params["stop_price"].as_f64() {
+                let r1 = |p: f64| (p * 10.0).round() / 10.0;
+                let limit_price = if order_type == "TAKE_PROFIT_MARKET" {
+                    r1(sp)
+                } else {
+                    let s = params["side"].as_str().unwrap_or("SELL");
+                    if s == "SELL" {
+                        r1(sp * 0.995)
+                    } else {
+                        r1(sp * 1.005)
+                    }
+                };
+                // Only add price if not already in parts (entry_better_pct may have set it)
+                if !parts.iter().any(|p| p.starts_with("price=")) {
+                    parts.push(format!("price={limit_price}"));
+                }
+            }
+            // Conditional closes always use reduceOnly=true + GTC.
             parts.push("reduceOnly=true".to_string());
-        }
-        // close_position=true uses Binance's closePosition flag — the correct way to
-        // set STOP_MARKET / TAKE_PROFIT_MARKET against an open position in one-way mode.
-        // Binance rejects reduceOnly=true for these types with -4120; closePosition=true
-        // is the documented alternative. Requires a position to exist (-4046 otherwise).
-        if params["close_position"].as_bool().unwrap_or(false) {
-            parts.push("closePosition=true".to_string());
-            // Binance rejects closePosition=true if quantity is also present — strip it.
-            parts.retain(|p| !p.starts_with("quantity="));
+            parts.push("timeInForce=GTC".to_string());
+        } else {
+            if order_type == "LIMIT" {
+                let tif = params["time_in_force"].as_str().unwrap_or("GTC");
+                parts.push(format!("timeInForce={tif}"));
+            }
+            if params["reduce_only"].as_bool().unwrap_or(false) {
+                parts.push("reduceOnly=true".to_string());
+            }
+            // close_position kept for MARKET closes only (not needed for STOP/TAKE_PROFIT).
+            if params["close_position"].as_bool().unwrap_or(false) && order_type == "MARKET" {
+                parts.push("closePosition=true".to_string());
+                parts.retain(|p| !p.starts_with("quantity="));
+            }
         }
         let ps = params["position_side"]
             .as_str()

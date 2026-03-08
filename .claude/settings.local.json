@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo fmt)",
+      "Bash(cargo clippy --all --all-features)",
+      "Bash(cargo test --lib -- tools::builtin::binance)"
+    ]
+  }
+}
