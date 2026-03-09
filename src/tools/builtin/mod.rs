@@ -18,8 +18,8 @@ mod time;
 mod web_fetch;
 
 pub use binance::{
-    BinanceFuturesAccountTool, BinanceFuturesOrderTool, BinanceFuturesSetTpSlTool,
-    BinanceSnapshotTool, PriceAnalysisTool,
+    BinanceFuturesAccountTool, BinanceFuturesOpenOrdersTool, BinanceFuturesOrderTool,
+    BinanceFuturesSetTpSlTool, BinanceSnapshotTool, PriceAnalysisTool,
 };
 pub use echo::EchoTool;
 pub use extension_tools::{

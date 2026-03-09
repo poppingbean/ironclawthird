@@ -1702,6 +1702,134 @@ impl Tool for BinanceFuturesSetTpSlTool {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. BinanceFuturesOpenOrdersTool
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Fetches all open orders for a USDT-M Futures symbol (or all symbols).
+///
+/// Used by routines to check whether TP/SL orders already exist before
+/// attempting to place new ones, preventing duplicate-order errors.
+pub struct BinanceFuturesOpenOrdersTool {
+    client: Client,
+}
+
+impl BinanceFuturesOpenOrdersTool {
+    pub fn new() -> Self {
+        Self {
+            client: build_client(30),
+        }
+    }
+}
+
+impl Default for BinanceFuturesOpenOrdersTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for BinanceFuturesOpenOrdersTool {
+    fn name(&self) -> &str {
+        "binance_open_orders"
+    }
+
+    fn description(&self) -> &str {
+        "Fetch all open orders for a Binance USDT-M Futures symbol. \
+         Pass symbol (e.g. BTCUSDT) to filter by pair, or omit for all symbols. \
+         Returns each order's type (TAKE_PROFIT, STOP, LIMIT, etc.), stop_price, \
+         quantity, and status. Use this before calling binance_set_tpsl to check \
+         whether TP/SL orders already exist for an open position. \
+         Requires BINANCE_API_KEY and BINANCE_API_SECRET."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "Trading pair to filter by, e.g. BTCUSDT. Omit to fetch open orders for all symbols."
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, params: Value, _ctx: &JobContext) -> Result<ToolOutput, ToolError> {
+        let start = Instant::now();
+        let api_key = binance_api_key()?;
+        let api_secret = binance_api_secret()?;
+
+        let ts = timestamp_ms()?;
+        let query = if let Some(sym) = params["symbol"].as_str() {
+            format!("symbol={}&timestamp={ts}", sym.to_uppercase())
+        } else {
+            format!("timestamp={ts}")
+        };
+
+        let sig = sign_query(&api_secret, &query)?;
+        let url = format!("{FAPI_BASE}/fapi/v1/openOrders?{query}&signature={sig}");
+
+        let resp = self
+            .client
+            .get(&url)
+            .header("X-MBX-APIKEY", &api_key)
+            .send()
+            .await
+            .map_err(|e| ToolError::ExternalService(format!("Open orders fetch failed: {e}")))?;
+
+        let st = resp.status();
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| ToolError::ExternalService(format!("Open orders JSON: {e}")))?;
+
+        if !st.is_success() {
+            return Err(ToolError::ExternalService(format!(
+                "Binance open orders {st}: {body}"
+            )));
+        }
+
+        let orders: Vec<Value> = body
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "order_id":      o["orderId"],
+                    "symbol":        o["symbol"],
+                    "side":          o["side"],
+                    "type":          o["type"],
+                    "price":         o["price"],
+                    "stop_price":    o["stopPrice"],
+                    "quantity":      o["origQty"],
+                    "status":        o["status"],
+                    "reduce_only":   o["reduceOnly"],
+                    "position_side": o["positionSide"]
+                })
+            })
+            .collect();
+
+        let count = orders.len();
+        Ok(ToolOutput::success(
+            serde_json::json!({ "orders": orders, "count": count }),
+            start.elapsed(),
+        ))
+    }
+
+    fn requires_sanitization(&self) -> bool {
+        true
+    }
+
+    fn requires_approval(&self, _params: &Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
+    }
+
+    fn rate_limit_config(&self) -> Option<ToolRateLimitConfig> {
+        Some(ToolRateLimitConfig::new(10, 60))
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
