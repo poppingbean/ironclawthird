@@ -1469,6 +1469,181 @@ impl Tool for BinanceFuturesOrderTool {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. BinanceFuturesSetTpSlTool
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Dedicated tool for placing Take-Profit and Stop-Loss orders against an
+/// existing USDT-M Futures position.
+///
+/// Uses `TAKE_PROFIT` and `STOP` (limit-conditional) order types which are
+/// always accepted on `/fapi/v1/order`. Never uses `TAKE_PROFIT_MARKET` or
+/// `STOP_MARKET` — those are rejected with Binance -4120 on certain accounts.
+///
+/// Both TP and SL are optional: pass only the ones you need. Each order uses:
+/// - `reduceOnly=true` so it can only close an existing position, never open one
+/// - `workingType=MARK_PRICE` to avoid wick-triggered fills
+/// - `timeInForce=GTC`
+/// - For SL: limit price is 0.5 % past trigger to absorb slippage
+/// - For TP: limit price equals stop price (fill at exact target)
+pub struct BinanceFuturesSetTpSlTool {
+    client: Client,
+}
+
+impl BinanceFuturesSetTpSlTool {
+    pub fn new() -> Self {
+        Self {
+            client: build_client(30),
+        }
+    }
+}
+
+impl Default for BinanceFuturesSetTpSlTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for BinanceFuturesSetTpSlTool {
+    fn name(&self) -> &str {
+        "binance_set_tpsl"
+    }
+
+    fn description(&self) -> &str {
+        "Place Take-Profit and/or Stop-Loss orders for an existing Binance USDT-M Futures \
+         position. Pass take_profit_price to set TP, stop_loss_price to set SL, or both. \
+         Uses TAKE_PROFIT and STOP limit-conditional orders (always accepted on /fapi/v1/order). \
+         Requires: symbol, close_side (BUY to close a SHORT, SELL to close a LONG), quantity \
+         (positionAmt from binance_futures_account). \
+         Requires BINANCE_API_KEY and BINANCE_API_SECRET."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "Trading pair, e.g. BTCUSDT"
+                },
+                "close_side": {
+                    "type": "string",
+                    "enum": ["BUY", "SELL"],
+                    "description": "Side that closes the position: SELL to close a LONG, BUY to close a SHORT"
+                },
+                "quantity": {
+                    "type": "number",
+                    "description": "Position size in base asset units (use positionAmt from binance_futures_account)"
+                },
+                "take_profit_price": {
+                    "type": "number",
+                    "description": "Trigger price for the Take-Profit order. Omit to skip TP."
+                },
+                "stop_loss_price": {
+                    "type": "number",
+                    "description": "Trigger price for the Stop-Loss order. Omit to skip SL."
+                },
+                "position_side": {
+                    "type": "string",
+                    "enum": ["BOTH", "LONG", "SHORT"],
+                    "default": "BOTH",
+                    "description": "Position side for hedge mode. Use BOTH for one-way mode."
+                }
+            },
+            "required": ["symbol", "close_side", "quantity"]
+        })
+    }
+
+    async fn execute(&self, params: Value, _ctx: &JobContext) -> Result<ToolOutput, ToolError> {
+        let start = Instant::now();
+        let api_key = binance_api_key()?;
+        let api_secret = binance_api_secret()?;
+
+        let symbol = params["symbol"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidParameters("symbol required".into()))?
+            .to_uppercase();
+        let close_side = params["close_side"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidParameters("close_side required".into()))?
+            .to_uppercase();
+        let quantity = params["quantity"]
+            .as_f64()
+            .filter(|&q| q > 0.0)
+            .ok_or_else(|| ToolError::InvalidParameters("quantity must be > 0".into()))?;
+        let position_side = params["position_side"]
+            .as_str()
+            .unwrap_or("BOTH")
+            .to_uppercase();
+
+        let has_tp = params["take_profit_price"].as_f64().is_some();
+        let has_sl = params["stop_loss_price"].as_f64().is_some();
+
+        if !has_tp && !has_sl {
+            return Err(ToolError::InvalidParameters(
+                "At least one of take_profit_price or stop_loss_price must be provided".into(),
+            ));
+        }
+
+        let mut result = serde_json::json!({});
+
+        if let Some(tp_price) = params["take_profit_price"].as_f64() {
+            let tp_order = place_close_order(
+                &self.client,
+                &api_key,
+                &api_secret,
+                &symbol,
+                &close_side,
+                "TAKE_PROFIT_MARKET",
+                tp_price,
+                &position_side,
+                quantity,
+            )
+            .await
+            .map_err(|e| {
+                ToolError::ExternalService(format!("Take-profit placement failed: {e}"))
+            })?;
+            result["take_profit"] = tp_order;
+        }
+
+        if let Some(sl_price) = params["stop_loss_price"].as_f64() {
+            let sl_order = place_close_order(
+                &self.client,
+                &api_key,
+                &api_secret,
+                &symbol,
+                &close_side,
+                "STOP_MARKET",
+                sl_price,
+                &position_side,
+                quantity,
+            )
+            .await
+            .map_err(|e| ToolError::ExternalService(format!("Stop-loss placement failed: {e}")))?;
+            result["stop_loss"] = sl_order;
+        }
+
+        result["symbol"] = serde_json::Value::String(symbol);
+        result["close_side"] = serde_json::Value::String(close_side);
+        result["quantity"] = serde_json::json!(quantity);
+
+        Ok(ToolOutput::success(result, start.elapsed()))
+    }
+
+    fn requires_sanitization(&self) -> bool {
+        true
+    }
+
+    fn requires_approval(&self, _params: &Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
+    }
+
+    fn rate_limit_config(&self) -> Option<ToolRateLimitConfig> {
+        Some(ToolRateLimitConfig::new(5, 60))
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────

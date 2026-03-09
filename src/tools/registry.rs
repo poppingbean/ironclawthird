@@ -16,13 +16,13 @@ use crate::skills::catalog::SkillCatalog;
 use crate::skills::registry::SkillRegistry;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
-    ApplyPatchTool, BinanceFuturesAccountTool, BinanceFuturesOrderTool, BinanceSnapshotTool,
-    CancelJobTool, CreateJobTool, EchoTool, HttpTool, JobEventsTool, JobPromptTool, JobStatusTool,
-    JsonTool, ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool,
-    MemoryWriteTool, PriceAnalysisTool, PromptQueue, ReadFileTool, ShellTool, SkillInstallTool,
-    SkillListTool, SkillRemoveTool, SkillSearchTool, TelegramNotifyTool, TimeTool,
-    ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
-    WebFetchTool, WriteFileTool,
+    ApplyPatchTool, BinanceFuturesAccountTool, BinanceFuturesOrderTool, BinanceFuturesSetTpSlTool,
+    BinanceSnapshotTool, CancelJobTool, CreateJobTool, EchoTool, HttpTool, JobEventsTool,
+    JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool, MemoryReadTool,
+    MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PriceAnalysisTool, PromptQueue,
+    ReadFileTool, ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool,
+    TelegramNotifyTool, TimeTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool,
+    ToolRemoveTool, ToolSearchTool, WebFetchTool, WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{Tool, ToolDomain};
@@ -499,8 +499,9 @@ impl ToolRegistry {
         self.register_sync(Arc::new(BinanceSnapshotTool::new()));
         self.register_sync(Arc::new(BinanceFuturesAccountTool::new()));
         self.register_sync(Arc::new(BinanceFuturesOrderTool::new()));
+        self.register_sync(Arc::new(BinanceFuturesSetTpSlTool::new()));
         self.register_sync(Arc::new(TelegramNotifyTool::new()));
-        tracing::info!("Registered 5 trading tools");
+        tracing::info!("Registered 6 trading tools");
     }
 
     /// Register a WASM tool from bytes.
