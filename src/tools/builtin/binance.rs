@@ -57,20 +57,20 @@ fn build_client(timeout_secs: u64) -> Client {
         .unwrap_or_default()
 }
 
-/// Place a bracket close order (TP or SL) against an open position using
-/// limit-conditional order types (`TAKE_PROFIT` / `STOP`) instead of their
-/// MARKET variants (`TAKE_PROFIT_MARKET` / `STOP_MARKET`).
+/// Place a TP or SL close order against an open position.
 ///
-/// Binance rejects `STOP_MARKET` and `TAKE_PROFIT_MARKET` on `/fapi/v1/order`
-/// with -4120 ("use algo endpoint") for certain account configurations regardless
-/// of `reduceOnly` or `closePosition` flags.
+/// Tries three progressively simpler parameter sets until one succeeds, to
+/// handle the various Binance account types that reject certain combinations
+/// with -4120 ("Order type not supported for this endpoint"):
 ///
-/// `TAKE_PROFIT` and `STOP` are standard limit-conditional orders that are always
-/// accepted on `/fapi/v1/order`. They trigger at `stopPrice` and fill as a LIMIT
-/// at `price`. For TP the limit price equals the stop trigger. For SL the limit
-/// price is set 0.5 % below the stop trigger to absorb normal slippage; if price
-/// gaps more than 0.5 % past the stop, the order may not fill (same risk as any
-/// stop-limit). `workingType=MARK_PRICE` avoids wick-triggered fills.
+/// Attempt 1 — `TAKE_PROFIT` / `STOP` (limit-conditional), minimal params,
+///   no `workingType`, no `positionSide`. Most compatible.
+/// Attempt 2 — same but adds `positionSide` (needed for hedge-mode accounts).
+/// Attempt 3 — falls back to `LIMIT` + `reduceOnly=true` for TP (fills when
+///   price reaches target). SL via LIMIT is not meaningful so attempt 3 only
+///   runs for TP-flavoured orders; SL stays at attempt 1/2.
+///
+/// The last error is propagated if all attempts fail.
 #[allow(clippy::too_many_arguments)]
 async fn place_close_order(
     client: &Client,
@@ -78,53 +78,111 @@ async fn place_close_order(
     api_secret: &str,
     symbol: &str,
     side: &str,
-    order_type: &str, // "TAKE_PROFIT_MARKET" or "STOP_MARKET" — remapped below
+    order_type: &str, // "TAKE_PROFIT_MARKET" or "STOP_MARKET" (logical label only)
     stop_price: f64,
     position_side: &str,
     quantity: f64,
 ) -> Result<Value, ToolError> {
-    // Remap market-conditional → limit-conditional so the order lands on the
-    // standard `/fapi/v1/order` endpoint instead of the algo endpoint.
     let r1 = |p: f64| (p * 10.0).round() / 10.0;
-    let (binance_type, limit_price) = match order_type {
-        "TAKE_PROFIT_MARKET" | "TAKE_PROFIT" => ("TAKE_PROFIT", r1(stop_price)),
-        _ => {
-            // STOP_MARKET → STOP; limit price 0.5% past trigger to absorb slippage.
-            let slippage = if side == "SELL" { 0.995 } else { 1.005 };
-            ("STOP", r1(stop_price * slippage))
-        }
+    let is_tp = matches!(order_type, "TAKE_PROFIT_MARKET" | "TAKE_PROFIT");
+    let (binance_type, limit_price) = if is_tp {
+        ("TAKE_PROFIT", r1(stop_price))
+    } else {
+        // SL: 0.5 % slippage buffer on limit price
+        let slippage = if side == "SELL" { 0.995 } else { 1.005 };
+        ("STOP", r1(stop_price * slippage))
     };
     let qty = (quantity * 1000.0).floor() / 1000.0;
-    let ts = timestamp_ms()?;
-    let query = format!(
-        "symbol={symbol}&side={side}&type={binance_type}&stopPrice={stop_price}\
-         &price={limit_price}&quantity={qty}&reduceOnly=true\
-         &timeInForce=GTC&workingType=MARK_PRICE\
-         &positionSide={position_side}&timestamp={ts}"
-    );
-    let sig = sign_query(api_secret, &query)?;
-    let url = format!("{FAPI_BASE}/fapi/v1/order?{query}&signature={sig}");
 
-    let resp = client
-        .post(&url)
+    // ── Attempt 1: minimal params, no workingType, no positionSide ───────────
+    let ts = timestamp_ms()?;
+    let q1 = format!(
+        "symbol={symbol}&side={side}&type={binance_type}\
+         &stopPrice={stop_price}&price={limit_price}\
+         &quantity={qty}&reduceOnly=true&timeInForce=GTC&timestamp={ts}"
+    );
+    let sig1 = sign_query(api_secret, &q1)?;
+    let resp1 = client
+        .post(format!("{FAPI_BASE}/fapi/v1/order?{q1}&signature={sig1}"))
         .header("X-MBX-APIKEY", api_key)
         .send()
         .await
-        .map_err(|e| ToolError::ExternalService(format!("{order_type} placement failed: {e}")))?;
+        .map_err(|e| ToolError::ExternalService(format!("{order_type} attempt1 network: {e}")))?;
+    let st1 = resp1.status();
+    let body1: Value = resp1.json().await.unwrap_or_default();
+    if st1.is_success() {
+        return Ok(serde_json::json!({
+            "order_id": body1["orderId"], "type": body1["type"],
+            "stop_price": body1["stopPrice"], "status": body1["status"]
+        }));
+    }
+    let err1 = format!("attempt1({binance_type}) {st1}: {body1}");
 
-    let st = resp.status();
-    let body: Value = resp.json().await.unwrap_or(serde_json::json!({}));
-    if !st.is_success() {
+    // ── Attempt 2: add positionSide (hedge-mode accounts) ────────────────────
+    let ts = timestamp_ms()?;
+    let q2 = format!(
+        "symbol={symbol}&side={side}&type={binance_type}\
+         &stopPrice={stop_price}&price={limit_price}\
+         &quantity={qty}&reduceOnly=true&timeInForce=GTC\
+         &positionSide={position_side}&timestamp={ts}"
+    );
+    let sig2 = sign_query(api_secret, &q2)?;
+    let resp2 = client
+        .post(format!("{FAPI_BASE}/fapi/v1/order?{q2}&signature={sig2}"))
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(|e| ToolError::ExternalService(format!("{order_type} attempt2 network: {e}")))?;
+    let st2 = resp2.status();
+    let body2: Value = resp2.json().await.unwrap_or_default();
+    if st2.is_success() {
+        return Ok(serde_json::json!({
+            "order_id": body2["orderId"], "type": body2["type"],
+            "stop_price": body2["stopPrice"], "status": body2["status"]
+        }));
+    }
+    let err2 = format!("attempt2({binance_type}+positionSide) {st2}: {body2}");
+
+    // ── Attempt 3 (TP only): plain LIMIT reduce-only at target price ──────────
+    // For accounts that reject all conditional types, a GTC LIMIT order at the
+    // TP price with reduceOnly=true is functionally equivalent: it sits in the
+    // book and fills when market price reaches the target.
+    // SL cannot be emulated with a LIMIT order (would fill immediately or miss),
+    // so attempt 3 is skipped for SL — the guardian routine covers SL via PnL%.
+    if is_tp {
+        let ts = timestamp_ms()?;
+        let q3 = format!(
+            "symbol={symbol}&side={side}&type=LIMIT\
+             &price={stop_price}&quantity={qty}\
+             &reduceOnly=true&timeInForce=GTC\
+             &positionSide={position_side}&timestamp={ts}"
+        );
+        let sig3 = sign_query(api_secret, &q3)?;
+        let resp3 = client
+            .post(format!("{FAPI_BASE}/fapi/v1/order?{q3}&signature={sig3}"))
+            .header("X-MBX-APIKEY", api_key)
+            .send()
+            .await
+            .map_err(|e| {
+                ToolError::ExternalService(format!("{order_type} attempt3 network: {e}"))
+            })?;
+        let st3 = resp3.status();
+        let body3: Value = resp3.json().await.unwrap_or_default();
+        if st3.is_success() {
+            return Ok(serde_json::json!({
+                "order_id": body3["orderId"], "type": body3["type"],
+                "price": body3["price"], "status": body3["status"],
+                "note": "placed as LIMIT (TP emulation) — conditional types rejected"
+            }));
+        }
         return Err(ToolError::ExternalService(format!(
-            "Binance {order_type} {st}: {body}"
+            "All TP attempts failed — {err1} | {err2} | attempt3(LIMIT) {st3}: {body3}"
         )));
     }
-    Ok(serde_json::json!({
-        "order_id": body["orderId"],
-        "type": body["type"],
-        "stop_price": body["stopPrice"],
-        "status": body["status"]
-    }))
+
+    Err(ToolError::ExternalService(format!(
+        "All SL attempts failed — {err1} | {err2}"
+    )))
 }
 
 /// Fetch the current mark price for a symbol from FAPI.
