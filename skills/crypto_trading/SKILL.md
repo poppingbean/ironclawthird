@@ -40,6 +40,7 @@ tools:
   - price_analysis
   - binance_snapshot
   - binance_futures_account
+  - binance_futures_order
   - telegram_notify
 metadata:
   openclaw:
@@ -147,31 +148,54 @@ Award +1 per condition true in the signal direction:
 
 ---
 
-## Step 6 — Generate Signal (score ≥ 5, no conflicting open position)
+## Step 6 — Place Order and Notify (score ≥ 5, no conflicting open position)
 
-**`telegram_notify` is called ONLY in two cases:**
-1. A new signal fires (score ≥ 5, this step).
-2. A position is closed (PnL check above).
+**Actions in this step:**
+1. Place the LIMIT entry order via `binance_futures_order`.
+2. Notify via `telegram_notify`.
+3. Record the position in memory.
 
 **Never call `telegram_notify` for a HOLD result.** Write the HOLD to the daily journal (Step 7) but send nothing to Telegram.
 
-| Parameter | Rule |
-|-----------|------|
-| Entry | Current 30m close price |
-| Stop-loss | Entry ± (entry × 1.2% / leverage) — always required |
-| Take-profit | Entry ± (SL distance × 2) — minimum 2:1 R:R |
-| Leverage | 25× (score 5–6), 50× (score 7–8), 75× (score 9–10) |
-| Order size | `orderSize30pct` from `binance_futures_account` (= 30% of `availableBalance`) |
+### 6a — Compute prices
 
-Call `telegram_notify` with **real computed values** — never placeholder text or `{{...}}` syntax:
+| Parameter | Formula |
+|-----------|---------|
+| entry | Current 30m close price |
+| sl_raw | LONG: `entry × (1 - 1.2% / leverage)` — SHORT: `entry × (1 + 1.2% / leverage)` |
+| tp_raw | LONG: `entry + (entry - sl_raw) × 2` — SHORT: `entry - (sl_raw - entry) × 2` |
+| sl_distance | `abs(entry - sl_raw)` |
+| **actual_tp** | LONG: `tp_raw + sl_distance × 0.20` — SHORT: `tp_raw - sl_distance × 0.20` (20% further than base TP) |
+| **actual_sl** | LONG: `sl_raw - sl_distance × 0.10` — SHORT: `sl_raw + sl_distance × 0.10` (10% more room than base SL) |
+| leverage | 25× (score 5–6), 50× (score 7–8), 75× (score 9–10) |
+
+### 6b — Place entry order
+
+Always use `balance_pct=30`. Never pass `quantity` or `quantity_usdt` directly.
 
 ```
-telegram_notify(message="🚀 SIGNAL: BTCUSDT LONG\nEntry: 95,200 | TP: 99,500 | SL: 93,800\nLeverage: 50x | Size: 30% (= $300)\nScore: 7/10 | RSI 1h: 38 | BB %B: 0.18 | MACD: Bullish | 3/3 TF")
+binance_futures_order(
+  symbol          = <symbol>,
+  side            = <BUY for LONG / SELL for SHORT>,
+  order_type      = LIMIT,
+  price           = <entry>,
+  balance_pct     = 30,
+  leverage        = <leverage>,
+  entry_better_pct = 20
+)
 ```
 
-Record the position:
+If the order call fails → `telegram_notify` the error → stop. Do not proceed to TP/SL.
+
+After the entry order is placed, write the position to memory:
 ```
-memory_write("trading/positions/btcusdt.md", "LONG | entry=95200 | leverage=50 | ts=2026-02-27T15:00:00Z")
+memory_write("trading/positions/btcusdt.md", "LONG | entry=<entry> | tp=<actual_tp> | sl=<actual_sl> | leverage=<leverage> | ts=<UTC timestamp>")
+```
+
+### 6c — Notify
+
+```
+telegram_notify(message="🚀 SIGNAL: BTCUSDT LONG\nEntry: 95,200 | TP: 99,500 | SL: 93,100\nLeverage: 50x | Size: 30%\nScore: 7/10 | RSI 1h: 38 | BB %B: 0.18 | MACD: Bullish | 3/3 TF")
 ```
 
 ---
@@ -217,7 +241,7 @@ Include all indicators computed. HOLD entries matter as much as signals.
 - **Score < 5 → always HOLD.** Never lower the bar. Never send Telegram for a HOLD.
 - **One position per pair.** Never issue a second signal while one is open.
 - **Stop-loss required.** Always include SL in the signal message.
-- **10% max per trade.** Never recommend a larger size.
+- **30% max per trade.** Never recommend a larger size. Always pass `balance_pct=30`.
 - **Leverage cap:** BTC/ETH ≤ 75×. Never suggest higher.
 - **Bollinger Bands alone never justify a signal.** Always require ≥ 2 confirming indicators.
 

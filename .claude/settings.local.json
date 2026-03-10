@@ -6,7 +6,9 @@
       "Bash(cargo test --lib -- tools::builtin::binance)",
       "Bash(git stash:*)",
       "Skill(ship)",
-      "Skill(ship:*)"
+      "Skill(ship:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo test:*)"
     ]
   }
 }
