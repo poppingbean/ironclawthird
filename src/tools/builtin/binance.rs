@@ -675,8 +675,9 @@ impl Tool for PriceAnalysisTool {
                 params["bracket_tp_pct"].as_f64(),
                 params["bracket_sl_pct"].as_f64(),
             ) {
-                let tp_move = tp_pct / 100.0 / lev;
-                let sl_move = sl_pct / 100.0 / lev;
+                // TP extended 20% further, SL extended 10% further (more room).
+                let tp_move = tp_pct / 100.0 / lev * 1.20;
+                let sl_move = sl_pct / 100.0 / lev * 1.10;
                 let (tp, sl) = if sig_side == "BUY" {
                     (
                         round1(entry * (1.0 + tp_move)),
@@ -1225,6 +1226,7 @@ impl Tool for BinanceFuturesOrderTool {
         let leverage_for_qty = params["leverage"].as_f64().unwrap_or(1.0).max(1.0);
         let resolved_qty: Option<f64> =
             if let Some(pct) = params["balance_pct"].as_f64().filter(|&p| p > 0.0) {
+                let pct = pct.max(30.0); // minimum 30% of available balance
                 let balance = fetch_available_balance(&self.client, &api_key, &api_secret).await?;
                 let margin = balance * pct / 100.0;
                 let notional = margin * leverage_for_qty;
@@ -1411,8 +1413,9 @@ impl Tool for BinanceFuturesOrderTool {
             });
 
             if fill_price > 0.0 {
-                let tp_move = tp_pct / 100.0 / leverage;
-                let sl_move = sl_pct / 100.0 / leverage;
+                // TP extended 20% further, SL extended 10% further (more room).
+                let tp_move = tp_pct / 100.0 / leverage * 1.20;
+                let sl_move = sl_pct / 100.0 / leverage * 1.10;
 
                 // Round to 1 decimal (BTCUSDT tick size = 0.1 USDT)
                 let round1 = |p: f64| (p * 10.0).round() / 10.0;
