@@ -103,30 +103,6 @@ Missing position file = no tracked signal for that pair.
 
 ---
 
-## Position PnL Check
-
-For **each pair that has an open position file**:
-
-1. Parse entry price, direction (LONG/SHORT), and leverage from the position file.
-2. Use the current 30m close price.
-3. Calculate PnL%:
-   - LONG:  `pnl_pct = (current - entry) / entry × 100 × leverage`
-   - SHORT: `pnl_pct = (entry - current) / entry × 100 × leverage`
-4. **Trigger close if:**
-   - PnL% > +60% → take-profit triggered
-   - PnL% < −35% → stop-loss triggered
-   - Signal in Step 5 produces the **opposite** direction
-
-When closing:
-```
-telegram_notify(message="⛔ CLOSE: BTCUSDT LONG\nReason: PnL +63% — take-profit triggered\nEntry: 95,200 | Current: ~108,000")
-memory_write("trading/positions/btcusdt.md", "CLOSED")
-```
-
-After closing, re-evaluate that pair for a fresh signal (Step 5).
-
----
-
 ## Step 5 — Signal Analysis
 
 ### 5a — Top-Down Timeframe Cascade
@@ -185,12 +161,12 @@ Award +1 per condition true in the signal direction:
 | Stop-loss | Entry ± (entry × 1.2% / leverage) — always required |
 | Take-profit | Entry ± (SL distance × 2) — minimum 2:1 R:R |
 | Leverage | 25× (score 5–6), 50× (score 7–8), 75× (score 9–10) |
-| Order size | `orderSize10pct` from `binance_futures_account` (= 10% of `availableBalance`) |
+| Order size | `orderSize30pct` from `binance_futures_account` (= 30% of `availableBalance`) |
 
 Call `telegram_notify` with **real computed values** — never placeholder text or `{{...}}` syntax:
 
 ```
-telegram_notify(message="🚀 SIGNAL: BTCUSDT LONG\nEntry: 95,200 | TP: 99,500 | SL: 93,800\nLeverage: 50x | Size: 10% (= $100)\nScore: 7/10 | RSI 1h: 38 | BB %B: 0.18 | MACD: Bullish | 3/3 TF")
+telegram_notify(message="🚀 SIGNAL: BTCUSDT LONG\nEntry: 95,200 | TP: 99,500 | SL: 93,800\nLeverage: 50x | Size: 30% (= $300)\nScore: 7/10 | RSI 1h: 38 | BB %B: 0.18 | MACD: Bullish | 3/3 TF")
 ```
 
 Record the position:
@@ -227,7 +203,7 @@ with the existing content followed by your new block. Use real computed numbers 
 - **4h:** Below EMA(50)
 
 ### Capital
-- Available: $50 | Order size: $5 (10%)
+- Available: $50 | Order size: $15 (30%)
 - Open positions: BTCUSDT LONG (entry 95,200)
 ---
 ```

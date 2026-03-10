@@ -856,7 +856,7 @@ impl Tool for BinanceSnapshotTool {
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Returns the USDT-M Futures account balance, open positions, and a pre-computed
-/// `orderSize10pct` field (= 10 % of available balance) for the crypto_trading skill.
+/// `orderSize30pct` field (= 30 % of available balance) for the crypto_trading skill.
 pub struct BinanceFuturesAccountTool {
     client: Client,
 }
@@ -884,7 +884,7 @@ impl Tool for BinanceFuturesAccountTool {
     fn description(&self) -> &str {
         "Fetch Binance USDT-M Futures account balance and all open positions. \
          Returns availableBalance, totalWalletBalance, totalUnrealizedProfit, \
-         orderSize10pct (10 % of available balance), and non-zero positions with \
+         orderSize30pct (30 % of available balance), and non-zero positions with \
          entry price, leverage, and unrealised PnL. \
          Requires BINANCE_API_KEY and BINANCE_API_SECRET."
     }
@@ -962,7 +962,7 @@ impl Tool for BinanceFuturesAccountTool {
             "available_balance": r2(avail),
             "total_wallet_balance": r2(wallet),
             "total_unrealized_pnl": r2(pnl),
-            "orderSize10pct": r2(avail * 0.1),
+            "orderSize30pct": r2(avail * 0.3),
             "open_positions": positions.len(),
             "positions": positions
         });

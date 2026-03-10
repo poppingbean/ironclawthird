@@ -4,7 +4,9 @@
       "Bash(cargo fmt)",
       "Bash(cargo clippy --all --all-features)",
       "Bash(cargo test --lib -- tools::builtin::binance)",
-      "Bash(git stash:*)"
+      "Bash(git stash:*)",
+      "Skill(ship)",
+      "Skill(ship:*)"
     ]
   }
 }
